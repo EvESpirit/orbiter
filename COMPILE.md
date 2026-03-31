@@ -1,7 +1,18 @@
+
+AUTOBUILDER
+=============
+A new script allows any Windows 11/10 based environment to automatically get the depenancies it requires in order to be able to compile Orbiter from scratch. Tested with Python v3.13+.
+
+All you have to do is copy the Python code located in the root of the repository, titled compileOrbiter.py, save it anywhere you'd like your repository clone to go, and run the script. Simply follow the proces that's presented.
+
+If the script fails to work for you, please open a issue on the Github, and provide a log of the script's output.
+Otherwise, reffer to the setup guide below.
+
+
 PREREQUISITES
 =============
 
-To build Orbiter from its sources you need a C++ compiler able to create Windows binaries.
+To build Orbiter from its sources manually, you need a C++ compiler able to create Windows binaries.
 Orbiter has been built successfully with Visual Studio 2019 Community
 https://visualstudio.microsoft.com/downloads/
 

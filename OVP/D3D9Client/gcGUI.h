@@ -101,7 +101,9 @@ public:
 	inline bool Initialize()
 	{
 		typedef gcGUIBase * (__cdecl *__gcGetGUICore)();
-		HMODULE hModule = GetModuleHandle("D3D9Client.dll");
+		HMODULE hModule = oapiGetGraphicsClientModule();
+		if (!hModule) hModule = GetModuleHandle("VulkanClient.dll");
+		if (!hModule) hModule = GetModuleHandle("D3D9Client.dll");
 		if (hModule) {
 			__gcGetGUICore pGetGUICore = (__gcGetGUICore)GetProcAddress(hModule, "gcGetGUICore");
 			if (pGetGUICore) return ((pApp = pGetGUICore()) != NULL);

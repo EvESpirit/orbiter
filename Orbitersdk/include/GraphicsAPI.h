@@ -1499,6 +1499,14 @@ public:
 	// counter and releasing it once the frame has been rendered.
 	virtual uint64_t clbkImGuiSurfaceTexture(SURFHANDLE surf) = 0;
 
+	/**
+	 * \brief Query an optional client-specific or extended interface by name
+	 * \param name null-terminated interface identifier string
+	 * \return Opaque pointer to the requested interface, or nullptr if unsupported
+	 * \default Returns nullptr.
+	 */
+	virtual void *clbkGetExtendedInterface (const char *name) { return nullptr; }
+
 protected:
 	/** \brief Launchpad video tab indicator
 	 *

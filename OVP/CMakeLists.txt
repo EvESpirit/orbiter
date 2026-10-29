@@ -25,3 +25,7 @@ install(FILES ${OVP_INCLUDE_TARGET_DIR}/gcGUI.h DESTINATION ${ORBITER_INSTALL_RO
 if(ORBITER_BUILD_D3D9CLIENT)
 	add_subdirectory(D3D9Client)
 endif()
+
+if(ORBITER_BUILD_VULKANCLIENT AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/VulkanClient/CMakeLists.txt")
+	add_subdirectory(VulkanClient)
+endif()

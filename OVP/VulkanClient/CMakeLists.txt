@@ -65,6 +65,7 @@ set(VKCLIENT_API_HEADERS
   ${ORBITER_BINARY_SDK_DIR}/include/gcCoreAPI.h
   ${ORBITER_BINARY_SDK_DIR}/include/gcGUI.h
 )
+set_source_files_properties(${VKCLIENT_API_HEADERS} PROPERTIES GENERATED TRUE)
 
 source_group("Include Files" FILES ${VKCLIENT_HEADERS})
 source_group("Source Files" FILES ${VKCLIENT_SOURCES})

@@ -6,8 +6,9 @@
 
 include(FetchContent)
 
-# SOURCE_SUBDIR points to a dummy subdir so FetchContent populates
-# <pkg>_SOURCE_DIR without adding third-party install() targets.
+# Fetch matching header/single-TU Vulkan 1.3 dependencies.
+# SOURCE_SUBDIR points to a dummy directory so CMake populates
+# <pkg>_SOURCE_DIR without executing third-party install() targets.
 FetchContent_Declare(
   vulkan_headers
   GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
@@ -40,12 +41,13 @@ FetchContent_Declare(
   SOURCE_SUBDIR  _noop_header_only
 )
 
-FetchContent_MakeAvailable(vulkan_headers volk vk_bootstrap vma)
+FetchContent_MakeAvailable(imgui vulkan_headers volk vk_bootstrap vma)
 
 set(VKCLIENT_SOURCES
   VkAPI.cpp
   VkLog.cpp
   VkConfig.cpp
+  VideoTab.cpp
   VulkanClient.cpp
   ${vk_bootstrap_SOURCE_DIR}/src/VkBootstrap.cpp
 )
@@ -55,6 +57,7 @@ set(VKCLIENT_HEADERS
   VkAPI.h
   VkLog.h
   VkConfig.h
+  VideoTab.h
   VulkanClient.h
 )
 
@@ -93,6 +96,8 @@ target_include_directories(VulkanClient PRIVATE
   ${volk_SOURCE_DIR}
   ${vk_bootstrap_SOURCE_DIR}/src
   ${vma_SOURCE_DIR}/include
+  ${imgui_SOURCE_DIR}
+  ${imgui_SOURCE_DIR}/backends
 )
 
 target_link_directories(VulkanClient PRIVATE

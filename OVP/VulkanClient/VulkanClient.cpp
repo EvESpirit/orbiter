@@ -11,6 +11,7 @@
 #include "VulkanClient.h"
 #include "VideoTab.h"
 #include "VkConfig.h"
+#include "VkContext.h"
 #include "VkLog.h"
 #include "imgui.h"
 #include <cstring>
@@ -147,6 +148,24 @@ private:
 	Brush *curBrush = nullptr;
 	FMATRIX4 identMat{};
 };
+
+// Restyle Orbiter's 10x10 fullscreen dummy popup into a borderless window.
+// Exclusive fullscreen is never used, so styles 0 and 1 are identical here.
+// style 2 = work area (keeps the taskbar), pageflip = span all monitors.
+void ApplyBorderlessWindow(HWND hWnd, const oapi::GraphicsClient::VIDEODATA *data)
+{
+	RECT rc{ 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+	if (data->style == 2)
+		SystemParametersInfoA(SPI_GETWORKAREA, 0, &rc, 0);
+	if (data->pageflip) {
+		rc.left  = GetSystemMetrics(SM_XVIRTUALSCREEN);
+		rc.right = rc.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+	}
+
+	SetWindowLongPtrA(hWnd, GWL_STYLE, WS_POPUP | WS_CLIPCHILDREN | WS_VISIBLE);
+	SetWindowPos(hWnd, HWND_TOP, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+		SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+}
 } // namespace
 
 extern "C" {
@@ -210,6 +229,7 @@ VulkanClient::VulkanClient(HINSTANCE hInstance)
 
 VulkanClient::~VulkanClient()
 {
+	ctx.reset();
 	stubParticleStreams.clear();
 	for (SURFHANDLE h : managedStubSurfaces)
 		delete reinterpret_cast<VkPhase0SurfaceStub *>(h);
@@ -293,22 +313,46 @@ bool VulkanClient::clbkGetRenderParam(DWORD prm, DWORD *value) const
 
 HWND VulkanClient::clbkCreateRenderWindow()
 {
-	// STUB (Unit 0.2): Unit 0.2 initializes VkContext and VkSwapchainKHR on this window
+	VkLogAlw("================ clbkCreateRenderWindow ================");
+
 	if (g_vkConfig)
 		g_vkConfig->WriteParams();
 
 	VIDEODATA *data = GetVideoData();
-	bFullscreen = data->fullscreen;
-	viewW = (data->winw >= 320) ? (DWORD)data->winw : 1280;
-	viewH = (data->winh >= 200) ? (DWORD)data->winh : 720;
+	bFullscreen = false;
 
 	HWND hWnd = GraphicsClient::clbkCreateRenderWindow();
+	if (!hWnd) {
+		VkLogErr("Render window creation failed");
+		return NULL;
+	}
+	SetWindowTextA(hWnd, "[VulkanClient]");
+
+	if (data->fullscreen)
+		ApplyBorderlessWindow(hWnd, data);
+	UpdateViewportSize(hWnd);
+	VkLogInfo("Render window %ux%u (%s)", viewW, viewH, data->fullscreen ? "borderless" : "windowed");
+
+	ctx = std::make_unique<VkContext>();
+	const bool validation = g_vkConfig && g_vkConfig->ValidationLayers;
+	if (!ctx->Create(hWnd, data->deviceidx, validation)) {
+		ctx.reset();
+		VkLogErr("Vulkan initialisation failed; rendering is disabled for this session");
+		MessageBoxA(hWnd,
+			"Failed to initialise Vulkan 1.3.\nSee VulkanClient.log for details.",
+			"VulkanClient Error", MB_OK | MB_ICONERROR);
+	}
+
+	return hWnd;
+}
+
+void VulkanClient::UpdateViewportSize(HWND hWnd)
+{
 	RECT rc{};
 	if (hWnd && GetClientRect(hWnd, &rc)) {
 		if (rc.right > rc.left) viewW = (DWORD)(rc.right - rc.left);
 		if (rc.bottom > rc.top) viewH = (DWORD)(rc.bottom - rc.top);
 	}
-	return hWnd;
 }
 
 void VulkanClient::clbkPostCreation()
@@ -318,7 +362,7 @@ void VulkanClient::clbkPostCreation()
 
 void VulkanClient::clbkCloseSession(bool fastclose)
 {
-	// STUB (Unit 0.2 / Phase 1): Release session stubs
+	// STUB (Phase 1): Release session stubs
 	(void)fastclose;
 	stubParticleStreams.clear();
 	for (SURFHANDLE h : managedStubSurfaces)
@@ -328,29 +372,31 @@ void VulkanClient::clbkCloseSession(bool fastclose)
 
 void VulkanClient::clbkDestroyRenderWindow(bool fastclose)
 {
-	// STUB (Unit 0.2): Swapchain and context teardown
+	VkLogAlw("================ clbkDestroyRenderWindow ================");
 	GraphicsClient::clbkDestroyRenderWindow(fastclose);
+	// Called from WM_DESTROY after all session surfaces were released; HWND is still valid
+	ctx.reset();
 }
 
 void VulkanClient::clbkBeginFrame()
 {
-	// STUB (Unit 0.2): Frame bracket begin
+	// STUB (Unit 0.2b): Frame bracket begin
 }
 
 void VulkanClient::clbkRenderScene()
 {
-	// STUB (Unit 0.2 / Phase 2): Scene render pass
+	// STUB (Unit 0.2b / Phase 2): Scene render pass
 	Render2DOverlay();
 }
 
 void VulkanClient::clbkEndFrame()
 {
-	// STUB (Unit 0.2 / Unit 0.3): Frame bracket end
+	// STUB (Unit 0.2b / Unit 0.3): Frame bracket end
 }
 
 bool VulkanClient::clbkDisplayFrame()
 {
-	// STUB (Unit 0.2): Swapchain presentation
+	// STUB (Unit 0.2b): Swapchain presentation
 	return true;
 }
 

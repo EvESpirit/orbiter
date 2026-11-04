@@ -47,6 +47,7 @@ set(VKCLIENT_SOURCES
   VkAPI.cpp
   VkLog.cpp
   VkConfig.cpp
+  VkContext.cpp
   VideoTab.cpp
   VulkanClient.cpp
   ${vk_bootstrap_SOURCE_DIR}/src/VkBootstrap.cpp
@@ -57,6 +58,7 @@ set(VKCLIENT_HEADERS
   VkAPI.h
   VkLog.h
   VkConfig.h
+  VkContext.h
   VideoTab.h
   VulkanClient.h
 )

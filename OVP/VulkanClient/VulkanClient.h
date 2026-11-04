@@ -14,6 +14,7 @@
 #include <vector>
 
 class VideoTab;
+class VkContext;
 
 namespace oapi {
 
@@ -74,24 +75,27 @@ public:
 protected:
 	bool clbkUseLaunchpadVideoTab() const override { return true; }
 
-	// STUB (Unit 0.2): Render window, VkContext, swapchain, and frame-bracket lifecycle
 	HWND clbkCreateRenderWindow() override;
 	void clbkPostCreation() override;
 	void clbkCloseSession(bool fastclose) override;
 	void clbkDestroyRenderWindow(bool fastclose) override;
 
+	// STUB (Unit 0.2b): Swapchain and frame-bracket lifecycle
 	void clbkBeginFrame() override;
 	void clbkRenderScene() override;
 	void clbkEndFrame() override;
 	bool clbkDisplayFrame() override;
 
 private:
+	void UpdateViewportSize(HWND hWnd);
+
 	std::unique_ptr<VideoTab> vtab;
+	std::unique_ptr<VkContext> ctx;                                 ///< Per-session Vulkan device (null outside a session)
 	std::vector<SURFHANDLE> managedStubSurfaces;                     // STUB (Phase 1): Global textures awaiting session cleanup
 	std::vector<std::unique_ptr<ParticleStream>> stubParticleStreams; // STUB (Phase 4): Vessel exhaust stream placeholders
 	DWORD viewW = 1280;                                             ///< Active render viewport width [px]
 	DWORD viewH = 720;                                              ///< Active render viewport height [px]
-	bool bFullscreen = false;                                       ///< True when running in fullscreen mode
+	bool bFullscreen = false;                                       ///< Always false: full screen is a borderless window, never exclusive
 };
 
 } // namespace oapi

@@ -40,6 +40,7 @@ public:
 	VkSurfaceKHR Surface() const { return surface; }
 	VkPhysicalDevice PhysicalDevice() const { return physicalDevice.physical_device; }
 	VkDevice Device() const { return device.device; }
+	const vkb::Device &VkbDevice() const { return device; }
 	VmaAllocator Allocator() const { return allocator; }
 	VkQueue GraphicsQueue() const { return graphicsQueue; }
 	VkQueue PresentQueue() const { return presentQueue; }

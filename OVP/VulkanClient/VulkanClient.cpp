@@ -12,6 +12,7 @@
 #include "VideoTab.h"
 #include "VkConfig.h"
 #include "VkContext.h"
+#include "VkSwapchain.h"
 #include "VkLog.h"
 #include "imgui.h"
 #include <cstring>
@@ -229,6 +230,7 @@ VulkanClient::VulkanClient(HINSTANCE hInstance)
 
 VulkanClient::~VulkanClient()
 {
+	swapchain.reset();
 	ctx.reset();
 	stubParticleStreams.clear();
 	for (SURFHANDLE h : managedStubSurfaces)
@@ -341,7 +343,25 @@ HWND VulkanClient::clbkCreateRenderWindow()
 		MessageBoxA(hWnd,
 			"Failed to initialise Vulkan 1.3.\nSee VulkanClient.log for details.",
 			"VulkanClient Error", MB_OK | MB_ICONERROR);
+		return hWnd;
 	}
+
+	swapchain = std::make_unique<VkSwapchain>();
+	if (!swapchain->Create(*ctx, viewW, viewH, data->novsync)) {
+		swapchain.reset();
+		ctx.reset();
+		VkLogErr("Swapchain initialisation failed; rendering is disabled for this session");
+		MessageBoxA(hWnd,
+			"Failed to create Vulkan swapchain.\nSee VulkanClient.log for details.",
+			"VulkanClient Error", MB_OK | MB_ICONERROR);
+		return hWnd;
+	}
+
+	viewW = swapchain->Extent().width;
+	viewH = swapchain->Extent().height;
+
+	// Present an initial cleared frame immediately so the window is not white during world load
+	swapchain->Present(hWnd);
 
 	return hWnd;
 }
@@ -375,29 +395,43 @@ void VulkanClient::clbkDestroyRenderWindow(bool fastclose)
 	VkLogAlw("================ clbkDestroyRenderWindow ================");
 	GraphicsClient::clbkDestroyRenderWindow(fastclose);
 	// Called from WM_DESTROY after all session surfaces were released; HWND is still valid
+	swapchain.reset();
 	ctx.reset();
 }
 
 void VulkanClient::clbkBeginFrame()
 {
-	// STUB (Unit 0.2b): Frame bracket begin
+	// STUB (Unit 0.2c): Flush cmdOffscreen before beginning main frame
+	if (!swapchain)
+		return;
+	if (swapchain->BeginFrame(GetRenderWindow())) {
+		viewW = swapchain->Extent().width;
+		viewH = swapchain->Extent().height;
+	}
 }
 
 void VulkanClient::clbkRenderScene()
 {
-	// STUB (Unit 0.2b / Phase 2): Scene render pass
+	// STUB (Phase 2): Replace solid clear with 3D scene pass
+	if (swapchain && swapchain->IsFrameRecording()) {
+		const VkClearColorValue clearCol = { { 1.0f, 0.0f, 1.0f, 1.0f } };
+		swapchain->ClearScene(clearCol);
+	}
 	Render2DOverlay();
 }
 
 void VulkanClient::clbkEndFrame()
 {
-	// STUB (Unit 0.2b / Unit 0.3): Frame bracket end
+	// STUB (Unit 0.3): Multi-viewport ImGui platform window update/render
+	if (swapchain)
+		swapchain->EndFrame();
 }
 
 bool VulkanClient::clbkDisplayFrame()
 {
-	// STUB (Unit 0.2b): Swapchain presentation
-	return true;
+	if (!swapchain)
+		return false;
+	return swapchain->Present(GetRenderWindow());
 }
 
 void VulkanClient::clbkImGuiInit()

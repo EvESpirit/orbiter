@@ -401,7 +401,6 @@ void VulkanClient::clbkDestroyRenderWindow(bool fastclose)
 
 void VulkanClient::clbkBeginFrame()
 {
-	// STUB (Unit 0.2c): Flush cmdOffscreen before beginning main frame
 	if (!swapchain)
 		return;
 	if (swapchain->BeginFrame(GetRenderWindow())) {
@@ -572,6 +571,71 @@ bool VulkanClient::clbkCopyBitmap(SURFHANDLE pdds, HBITMAP hbm, int x, int y, in
 	(void)dx;
 	(void)dy;
 	return true;
+}
+
+bool VulkanClient::clbkSaveSurfaceToImage(SURFHANDLE surf, const char *fname, ImageFileFormat fmt, float quality)
+{
+	// STUB (Phase 1): Non-null SURFHANDLE readback awaits VkSurfNative; surf == nullptr reads sceneImage
+	(void)surf;
+	if (!swapchain)
+		return false;
+
+	std::vector<uint8_t> bgra;
+	uint32_t w = 0, h = 0;
+	if (!swapchain->ReadbackSceneTarget(bgra, w, h) || w == 0 || h == 0)
+		return false;
+
+	if (!fname) {
+		HWND hWnd = GetRenderWindow();
+		if (!OpenClipboard(hWnd))
+			return false;
+
+		BITMAPINFO bmi{};
+		bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+		bmi.bmiHeader.biWidth       = (LONG)w;
+		bmi.bmiHeader.biHeight      = -(LONG)h;
+		bmi.bmiHeader.biPlanes      = 1;
+		bmi.bmiHeader.biBitCount    = 32;
+		bmi.bmiHeader.biCompression = BI_RGB;
+
+		void *bits = nullptr;
+		HDC hdc = GetDC(hWnd);
+		HBITMAP hbm = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+		if (hdc)
+			ReleaseDC(hWnd, hdc);
+
+		bool ok = false;
+		if (hbm && bits) {
+			std::memcpy(bits, bgra.data(), bgra.size());
+			EmptyClipboard();
+			ok = (SetClipboardData(CF_BITMAP, hbm) != nullptr);
+			if (!ok)
+				DeleteObject(hbm);
+		}
+		CloseClipboard();
+		return ok;
+	}
+
+	ImageData id{};
+	id.width   = w;
+	id.height  = h;
+	id.bpp     = 24;
+	id.stride  = ((w * 24u + 31u) & ~31u) >> 3;
+	id.bufsize = id.stride * h;
+
+	std::vector<BYTE> bgr(id.bufsize, 0);
+	for (uint32_t y = 0; y < h; ++y) {
+		const uint8_t *srcRow = bgra.data() + (size_t)y * w * 4;
+		BYTE *dstRow = bgr.data() + (size_t)y * id.stride;
+		for (uint32_t x = 0; x < w; ++x) {
+			dstRow[x * 3 + 0] = srcRow[x * 4 + 0];
+			dstRow[x * 3 + 1] = srcRow[x * 4 + 1];
+			dstRow[x * 3 + 2] = srcRow[x * 4 + 2];
+		}
+	}
+	id.data = bgr.data();
+
+	return WriteImageDataToFile(id, fname, fmt, quality);
 }
 
 Sketchpad *VulkanClient::clbkGetSketchpad(SURFHANDLE surf)

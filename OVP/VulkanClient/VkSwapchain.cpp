@@ -8,6 +8,7 @@
 #include "VkSwapchain.h"
 #include "VkContext.h"
 #include "VkLog.h"
+#include <cstring>
 
 namespace {
 
@@ -310,6 +311,23 @@ bool VkSwapchain::CreateFrameResources()
 		}
 	}
 
+	if (vkCreateCommandPool(ctx->Device(), &cpci, nullptr, &offscreenPool) != VK_SUCCESS) {
+		VkLogErr("vkCreateCommandPool (offscreen) failed");
+		return false;
+	}
+
+	VkCommandBufferAllocateInfo cbai{};
+	cbai.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+	cbai.commandPool        = offscreenPool;
+	cbai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	cbai.commandBufferCount = 1;
+	if (vkAllocateCommandBuffers(ctx->Device(), &cbai, &cmdOffscreen) != VK_SUCCESS ||
+		vkCreateFence(ctx->Device(), &fci, nullptr, &offscreenFence) != VK_SUCCESS)
+	{
+		VkLogErr("Offscreen command stream creation failed");
+		return false;
+	}
+
 	return true;
 }
 
@@ -317,6 +335,18 @@ void VkSwapchain::DestroyFrameResources()
 {
 	if (!ctx || ctx->Device() == VK_NULL_HANDLE)
 		return;
+
+	if (offscreenFence != VK_NULL_HANDLE) {
+		vkDestroyFence(ctx->Device(), offscreenFence, nullptr);
+		offscreenFence = VK_NULL_HANDLE;
+	}
+	if (offscreenPool != VK_NULL_HANDLE) {
+		vkDestroyCommandPool(ctx->Device(), offscreenPool, nullptr);
+		offscreenPool = VK_NULL_HANDLE;
+		cmdOffscreen = VK_NULL_HANDLE;
+	}
+	offscreenRecording = false;
+	offscreenHasWork = false;
 
 	for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
 		if (frames[i].inFlight != VK_NULL_HANDLE) {
@@ -351,12 +381,148 @@ void VkSwapchain::TransitionSceneLayout(
 	sceneLayout = newLayout;
 }
 
+VkCommandBuffer VkSwapchain::OffscreenCommandBuffer()
+{
+	if (!ctx || cmdOffscreen == VK_NULL_HANDLE)
+		return VK_NULL_HANDLE;
+
+	if (!offscreenRecording) {
+		vkResetCommandPool(ctx->Device(), offscreenPool, 0);
+
+		VkCommandBufferBeginInfo cbbi{};
+		cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		if (vkBeginCommandBuffer(cmdOffscreen, &cbbi) != VK_SUCCESS)
+			return VK_NULL_HANDLE;
+
+		offscreenRecording = true;
+	}
+
+	offscreenHasWork = true;
+	return cmdOffscreen;
+}
+
+bool VkSwapchain::FlushOffscreenCommands()
+{
+	if (!ctx || !offscreenRecording)
+		return true;
+
+	offscreenRecording = false;
+	if (!offscreenHasWork) {
+		vkEndCommandBuffer(cmdOffscreen);
+		return true;
+	}
+	offscreenHasWork = false;
+
+	if (vkEndCommandBuffer(cmdOffscreen) != VK_SUCCESS)
+		return false;
+
+	vkResetFences(ctx->Device(), 1, &offscreenFence);
+
+	VkCommandBufferSubmitInfo cmdInfo{};
+	cmdInfo.sType         = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+	cmdInfo.commandBuffer = cmdOffscreen;
+
+	VkSubmitInfo2 submit{};
+	submit.sType                  = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+	submit.commandBufferInfoCount = 1;
+	submit.pCommandBufferInfos    = &cmdInfo;
+
+	if (vkQueueSubmit2(ctx->GraphicsQueue(), 1, &submit, offscreenFence) != VK_SUCCESS) {
+		VkLogErr("vkQueueSubmit2 (cmdOffscreen) failed");
+		return false;
+	}
+
+	return vkWaitForFences(ctx->Device(), 1, &offscreenFence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+}
+
+bool VkSwapchain::ReadbackSceneTarget(std::vector<uint8_t> &outBgra, uint32_t &outWidth, uint32_t &outHeight)
+{
+	if (!ctx || !IsValid() || sceneImage == VK_NULL_HANDLE ||
+		sceneExtent.width == 0 || sceneExtent.height == 0 ||
+		sceneLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+	{
+		return false;
+	}
+
+	FlushOffscreenCommands();
+	vkQueueWaitIdle(ctx->GraphicsQueue());
+
+	const uint32_t w = sceneExtent.width;
+	const uint32_t h = sceneExtent.height;
+	const VkDeviceSize byteSize = (VkDeviceSize)w * h * 4;
+
+	VkBufferCreateInfo bci{};
+	bci.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	bci.size        = byteSize;
+	bci.usage       = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+	VmaAllocationCreateInfo aci{};
+	aci.usage = VMA_MEMORY_USAGE_AUTO;
+	aci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+	VkBuffer stagingBuf = VK_NULL_HANDLE;
+	VmaAllocation stagingAlloc = VK_NULL_HANDLE;
+	VmaAllocationInfo allocInfo{};
+	if (vmaCreateBuffer(ctx->Allocator(), &bci, &aci, &stagingBuf, &stagingAlloc, &allocInfo) != VK_SUCCESS) {
+		VkLogErr("ReadbackSceneTarget: vmaCreateBuffer failed");
+		return false;
+	}
+
+	VkCommandBuffer cmd = OffscreenCommandBuffer();
+	if (cmd == VK_NULL_HANDLE) {
+		vmaDestroyBuffer(ctx->Allocator(), stagingBuf, stagingAlloc);
+		return false;
+	}
+
+	TransitionSceneLayout(
+		cmd,
+		VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+		VK_ACCESS_2_MEMORY_WRITE_BIT,
+		VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+		VK_ACCESS_2_TRANSFER_READ_BIT);
+
+	VkBufferImageCopy2 region{};
+	region.sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2;
+	region.imageSubresource.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+	region.imageSubresource.mipLevel       = 0;
+	region.imageSubresource.baseArrayLayer = 0;
+	region.imageSubresource.layerCount     = 1;
+	region.imageOffset = { 0, 0, 0 };
+	region.imageExtent = { w, h, 1 };
+
+	VkCopyImageToBufferInfo2 copyInfo{};
+	copyInfo.sType          = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_BUFFER_INFO_2;
+	copyInfo.srcImage       = sceneImage;
+	copyInfo.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	copyInfo.dstBuffer      = stagingBuf;
+	copyInfo.regionCount    = 1;
+	copyInfo.pRegions       = &region;
+	vkCmdCopyImageToBuffer2(cmd, &copyInfo);
+
+	const bool ok = FlushOffscreenCommands() && allocInfo.pMappedData != nullptr;
+	if (ok) {
+		vmaInvalidateAllocation(ctx->Allocator(), stagingAlloc, 0, VK_WHOLE_SIZE);
+		outBgra.resize((size_t)byteSize);
+		std::memcpy(outBgra.data(), allocInfo.pMappedData, (size_t)byteSize);
+		outWidth  = w;
+		outHeight = h;
+	}
+
+	vmaDestroyBuffer(ctx->Allocator(), stagingBuf, stagingAlloc);
+	return ok;
+}
+
 bool VkSwapchain::BeginFrame(HWND hWnd)
 {
 	if (!ctx || !IsValid())
 		return false;
 	if (frameRecording)
 		return true;
+
+	FlushOffscreenCommands();
 
 	if (hWnd && IsIconic(hWnd))
 		return false;

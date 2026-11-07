@@ -54,6 +54,12 @@ public:
 	VkCommandBuffer CurrentCommandBuffer() const { return frames[currentFrame].cmd; }
 	uint32_t CurrentFrameIndex() const { return currentFrame; }
 
+	VkCommandBuffer OffscreenCommandBuffer();
+	VkCommandBuffer ActiveCommandBuffer() { return frameRecording ? frames[currentFrame].cmd : OffscreenCommandBuffer(); }
+	bool FlushOffscreenCommands();
+
+	bool ReadbackSceneTarget(std::vector<uint8_t> &outBgra, uint32_t &outWidth, uint32_t &outHeight);
+
 	void TransitionSceneLayout(
 		VkCommandBuffer cmd,
 		VkImageLayout newLayout,
@@ -100,6 +106,12 @@ private:
 	bool frameRecording = false;
 	bool frameReadyToPresent = false;
 	bool needsRecreate = false;
+
+	VkCommandPool offscreenPool = VK_NULL_HANDLE;
+	VkCommandBuffer cmdOffscreen = VK_NULL_HANDLE;
+	VkFence offscreenFence = VK_NULL_HANDLE;
+	bool offscreenRecording = false;
+	bool offscreenHasWork = false;
 };
 
 #endif // !__VKCLIENT_VKSWAPCHAIN_H

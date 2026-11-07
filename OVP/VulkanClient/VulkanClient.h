@@ -56,6 +56,7 @@ public:
 	bool clbkReleaseSurface(SURFHANDLE surf) override;
 	bool clbkGetSurfaceSize(SURFHANDLE surf, DWORD *w, DWORD *h) override;
 	bool clbkCopyBitmap(SURFHANDLE pdds, HBITMAP hbm, int x, int y, int dx, int dy) override;
+	bool clbkSaveSurfaceToImage(SURFHANDLE surf, const char *fname, ImageFileFormat fmt, float quality = 0.7f) override;
 
 	Sketchpad *clbkGetSketchpad(SURFHANDLE surf) override;
 	void clbkReleaseSketchpad(Sketchpad *sp) override;

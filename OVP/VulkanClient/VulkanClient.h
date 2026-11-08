@@ -10,6 +10,7 @@
 
 #include "Orbitersdk.h"
 #include "GraphicsAPI.h"
+#include "VkAPI.h"
 #include <memory>
 #include <vector>
 
@@ -35,7 +36,6 @@ public:
 	void clbkGetViewportSize(DWORD *width, DWORD *height) const override;
 	bool clbkGetRenderParam(DWORD prm, DWORD *value) const override;
 
-	// STUB (Unit 0.3): Dear ImGui Vulkan 1.3 dynamic-rendering + multi-viewport backend
 	void clbkImGuiInit() override;
 	void clbkImGuiShutdown() override;
 	void clbkImGuiNewFrame() override;
@@ -89,6 +89,8 @@ protected:
 
 private:
 	void UpdateViewportSize(HWND hWnd);
+	bool CreateImGuiPlaceholderTexture();
+	void DestroyImGuiPlaceholderTexture();
 
 	std::unique_ptr<VideoTab> vtab;
 	std::unique_ptr<VkContext> ctx;                                 ///< Per-session Vulkan device (null outside a session)
@@ -98,6 +100,16 @@ private:
 	DWORD viewW = 1280;                                             ///< Active render viewport width [px]
 	DWORD viewH = 720;                                              ///< Active render viewport height [px]
 	bool bFullscreen = false;                                       ///< Always false: full screen is a borderless window, never exclusive
+
+	bool imguiInitialized = false;                                  ///< True while ImGui_ImplVulkan backend is active
+	bool imguiFrameRendered = false;                                ///< True when clbkImGuiRenderDrawData ran this frame
+	VkFormat imguiMainFormat = VK_FORMAT_B8G8R8A8_UNORM;            ///< Color attachment format for main viewport dynamic rendering
+	VkFormat imguiViewportFormat = VK_FORMAT_B8G8R8A8_UNORM;        ///< Color attachment format for secondary viewports
+	VkImage imguiPlaceholderImage = VK_NULL_HANDLE;                 ///< 1x1 fallback texture for clbkImGuiSurfaceTexture until Phase 1
+	VmaAllocation imguiPlaceholderAlloc = VK_NULL_HANDLE;
+	VkImageView imguiPlaceholderView = VK_NULL_HANDLE;
+	VkSampler imguiPlaceholderSampler = VK_NULL_HANDLE;
+	VkDescriptorSet imguiPlaceholderDescSet = VK_NULL_HANDLE;
 };
 
 } // namespace oapi

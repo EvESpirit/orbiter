@@ -15,6 +15,8 @@
 #include "VkSwapchain.h"
 #include "VkLog.h"
 #include "imgui.h"
+#include "imgui_impl_vulkan.h"
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 
@@ -167,6 +169,27 @@ void ApplyBorderlessWindow(HWND hWnd, const oapi::GraphicsClient::VIDEODATA *dat
 	SetWindowPos(hWnd, HWND_TOP, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
 		SWP_SHOWWINDOW | SWP_FRAMECHANGED);
 }
+
+// Win32 surface hook required by ImGui_ImplVulkan when multi-viewports are enabled
+// (imgui_impl_win32.cpp lives in Orbiter.exe without Vulkan headers).
+int ImGuiWin32CreateVkSurface(ImGuiViewport *viewport, ImU64 vkInstance, const void *vkAllocator, ImU64 *outVkSurface)
+{
+	VkWin32SurfaceCreateInfoKHR createInfo{};
+	createInfo.sType     = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
+	createInfo.hwnd      = static_cast<HWND>(viewport->PlatformHandleRaw ? viewport->PlatformHandleRaw : viewport->PlatformHandle);
+	createInfo.hinstance = ::GetModuleHandleA(nullptr);
+	return static_cast<int>(vkCreateWin32SurfaceKHR(
+		reinterpret_cast<VkInstance>(static_cast<uintptr_t>(vkInstance)),
+		&createInfo,
+		static_cast<const VkAllocationCallbacks *>(vkAllocator),
+		reinterpret_cast<VkSurfaceKHR *>(outVkSurface)));
+}
+
+void CheckImGuiVkResult(VkResult err)
+{
+	if (err != VK_SUCCESS)
+		VkLogErr("ImGui Vulkan error: VkResult = %d", (int)err);
+}
 } // namespace
 
 extern "C" {
@@ -230,6 +253,8 @@ VulkanClient::VulkanClient(HINSTANCE hInstance)
 
 VulkanClient::~VulkanClient()
 {
+	if (imguiInitialized)
+		clbkImGuiShutdown();
 	swapchain.reset();
 	ctx.reset();
 	stubParticleStreams.clear();
@@ -393,6 +418,8 @@ void VulkanClient::clbkCloseSession(bool fastclose)
 void VulkanClient::clbkDestroyRenderWindow(bool fastclose)
 {
 	VkLogAlw("================ clbkDestroyRenderWindow ================");
+	if (imguiInitialized)
+		clbkImGuiShutdown();
 	GraphicsClient::clbkDestroyRenderWindow(fastclose);
 	// Called from WM_DESTROY after all session surfaces were released; HWND is still valid
 	swapchain.reset();
@@ -401,6 +428,7 @@ void VulkanClient::clbkDestroyRenderWindow(bool fastclose)
 
 void VulkanClient::clbkBeginFrame()
 {
+	imguiFrameRendered = false;
 	if (!swapchain)
 		return;
 	if (swapchain->BeginFrame(GetRenderWindow())) {
@@ -421,9 +449,16 @@ void VulkanClient::clbkRenderScene()
 
 void VulkanClient::clbkEndFrame()
 {
-	// STUB (Unit 0.3): Multi-viewport ImGui platform window update/render
 	if (swapchain)
 		swapchain->EndFrame();
+
+	if (imguiInitialized && imguiFrameRendered) {
+		imguiFrameRendered = false;
+		if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+			ImGui::UpdatePlatformWindows();
+			ImGui::RenderPlatformWindowsDefault();
+		}
+	}
 }
 
 bool VulkanClient::clbkDisplayFrame()
@@ -435,36 +470,254 @@ bool VulkanClient::clbkDisplayFrame()
 
 void VulkanClient::clbkImGuiInit()
 {
-	// STUB (Unit 0.3): Initialize dummy font atlas texture to prevent Core assert
-	ImGuiIO &io = ImGui::GetIO();
-	io.ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
-	unsigned char *pixels = nullptr;
-	int w = 0, h = 0;
-	io.Fonts->GetTexDataAsRGBA32(&pixels, &w, &h);
-	io.Fonts->SetTexID((ImTextureID)1);
+	if (!ctx || !swapchain || !swapchain->IsValid()) {
+		ImGuiIO &io = ImGui::GetIO();
+		io.ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
+		unsigned char *pixels = nullptr;
+		int w = 0, h = 0;
+		io.Fonts->GetTexDataAsRGBA32(&pixels, &w, &h);
+		io.Fonts->SetTexID((ImTextureID)1);
+		return;
+	}
+
+	ImGui::GetPlatformIO().Platform_CreateVkSurface = ImGuiWin32CreateVkSurface;
+
+	imguiMainFormat     = swapchain->SceneFormat();
+	imguiViewportFormat = swapchain->SwapchainFormat();
+
+	ImGui_ImplVulkan_InitInfo initInfo{};
+	initInfo.ApiVersion         = VK_API_VERSION_1_3;
+	initInfo.Instance           = ctx->Instance();
+	initInfo.PhysicalDevice     = ctx->PhysicalDevice();
+	initInfo.Device             = ctx->Device();
+	initInfo.QueueFamily        = ctx->GraphicsQueueFamily();
+	initInfo.Queue              = ctx->GraphicsQueue();
+	initInfo.DescriptorPoolSize = 1024;
+	initInfo.MinImageCount      = VkSwapchain::kMaxFramesInFlight;
+	initInfo.ImageCount         = std::max<uint32_t>(swapchain->ImageCount(), VkSwapchain::kMaxFramesInFlight);
+	initInfo.UseDynamicRendering = true;
+	initInfo.CheckVkResultFn    = CheckImGuiVkResult;
+
+	initInfo.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+	initInfo.PipelineInfoMain.PipelineRenderingCreateInfo.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+	initInfo.PipelineInfoMain.PipelineRenderingCreateInfo.colorAttachmentCount    = 1;
+	initInfo.PipelineInfoMain.PipelineRenderingCreateInfo.pColorAttachmentFormats = &imguiMainFormat;
+
+	initInfo.PipelineInfoForViewports.MSAASamples         = VK_SAMPLE_COUNT_1_BIT;
+	initInfo.PipelineInfoForViewports.SwapChainImageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+	initInfo.PipelineInfoForViewports.PipelineRenderingCreateInfo.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+	initInfo.PipelineInfoForViewports.PipelineRenderingCreateInfo.colorAttachmentCount    = 1;
+	initInfo.PipelineInfoForViewports.PipelineRenderingCreateInfo.pColorAttachmentFormats = &imguiViewportFormat;
+
+	if (!ImGui_ImplVulkan_Init(&initInfo)) {
+		VkLogErr("ImGui_ImplVulkan_Init failed");
+		return;
+	}
+
+	imguiInitialized   = true;
+	imguiFrameRendered = false;
+
+	if (!CreateImGuiPlaceholderTexture())
+		VkLogWarn("Failed to create ImGui placeholder surface texture");
+
+	VkLogInfo("ImGui Vulkan 1.3 backend initialised (dynamic rendering, viewports=%d)",
+		(ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) ? 1 : 0);
 }
 
 void VulkanClient::clbkImGuiShutdown()
 {
-	// STUB (Unit 0.3): ImGui backend shutdown
+	if (!imguiInitialized)
+		return;
+
+	if (ctx && ctx->Device())
+		vkDeviceWaitIdle(ctx->Device());
+
+	DestroyImGuiPlaceholderTexture();
+	ImGui_ImplVulkan_Shutdown();
+
+	imguiInitialized   = false;
+	imguiFrameRendered = false;
+	VkLogInfo("ImGui Vulkan 1.3 backend shut down");
 }
 
 void VulkanClient::clbkImGuiNewFrame()
 {
-	// STUB (Unit 0.3): ImGui frame start
+	if (imguiInitialized)
+		ImGui_ImplVulkan_NewFrame();
 }
 
 void VulkanClient::clbkImGuiRenderDrawData()
 {
-	// STUB (Unit 0.3): Finalize ImGui draw lists
 	ImGui::Render();
+	if (!imguiInitialized)
+		return;
+
+	imguiFrameRendered = true;
+	if (swapchain && swapchain->IsFrameRecording()) {
+		ImDrawData *drawData = ImGui::GetDrawData();
+		if (drawData)
+			ImGui_ImplVulkan_RenderDrawData(drawData, swapchain->CurrentCommandBuffer());
+	}
 }
 
 uint64_t VulkanClient::clbkImGuiSurfaceTexture(SURFHANDLE surf)
 {
-	// STUB (Unit 0.3 / Phase 1): Return descriptor set for VkSurfNative
+	// STUB (Phase 1): Return per-surface VkSurfNative descriptor set once implemented
 	(void)surf;
-	return 1;
+	return (uint64_t)imguiPlaceholderDescSet;
+}
+
+bool VulkanClient::CreateImGuiPlaceholderTexture()
+{
+	if (!ctx || !swapchain)
+		return false;
+
+	VkImageCreateInfo imgInfo{};
+	imgInfo.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imgInfo.imageType     = VK_IMAGE_TYPE_2D;
+	imgInfo.format        = VK_FORMAT_R8G8B8A8_UNORM;
+	imgInfo.extent.width  = 1;
+	imgInfo.extent.height = 1;
+	imgInfo.extent.depth  = 1;
+	imgInfo.mipLevels     = 1;
+	imgInfo.arrayLayers   = 1;
+	imgInfo.samples       = VK_SAMPLE_COUNT_1_BIT;
+	imgInfo.tiling        = VK_IMAGE_TILING_OPTIMAL;
+	imgInfo.usage         = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+	imgInfo.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+	imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+	VmaAllocationCreateInfo allocInfo{};
+	allocInfo.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+
+	VkResult vr = vmaCreateImage(ctx->Allocator(), &imgInfo, &allocInfo, &imguiPlaceholderImage, &imguiPlaceholderAlloc, nullptr);
+	if (vr != VK_SUCCESS) {
+		VkLogErr("vmaCreateImage (imguiPlaceholderImage) failed (VkResult = %d)", (int)vr);
+		return false;
+	}
+
+	VkCommandBuffer cmd = swapchain->OffscreenCommandBuffer();
+	if (cmd == VK_NULL_HANDLE) {
+		DestroyImGuiPlaceholderTexture();
+		return false;
+	}
+
+	VkImageMemoryBarrier2 toClear{};
+	toClear.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+	toClear.srcStageMask        = VK_PIPELINE_STAGE_2_NONE;
+	toClear.srcAccessMask       = VK_ACCESS_2_NONE;
+	toClear.dstStageMask        = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+	toClear.dstAccessMask       = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+	toClear.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
+	toClear.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	toClear.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	toClear.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	toClear.image               = imguiPlaceholderImage;
+	toClear.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+	toClear.subresourceRange.baseMipLevel   = 0;
+	toClear.subresourceRange.levelCount     = 1;
+	toClear.subresourceRange.baseArrayLayer = 0;
+	toClear.subresourceRange.layerCount     = 1;
+
+	VkDependencyInfo depClear{};
+	depClear.sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+	depClear.imageMemoryBarrierCount = 1;
+	depClear.pImageMemoryBarriers    = &toClear;
+	vkCmdPipelineBarrier2(cmd, &depClear);
+
+	const VkClearColorValue clearVal = { { 1.0f, 1.0f, 1.0f, 1.0f } };
+	VkImageSubresourceRange clearRange{};
+	clearRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+	clearRange.baseMipLevel   = 0;
+	clearRange.levelCount     = 1;
+	clearRange.baseArrayLayer = 0;
+	clearRange.layerCount     = 1;
+	vkCmdClearColorImage(cmd, imguiPlaceholderImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearVal, 1, &clearRange);
+
+	VkImageMemoryBarrier2 toSample{};
+	toSample.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+	toSample.srcStageMask        = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+	toSample.srcAccessMask       = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+	toSample.dstStageMask        = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+	toSample.dstAccessMask       = VK_ACCESS_2_SHADER_READ_BIT;
+	toSample.oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	toSample.newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	toSample.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	toSample.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	toSample.image               = imguiPlaceholderImage;
+	toSample.subresourceRange    = clearRange;
+
+	VkDependencyInfo depSample{};
+	depSample.sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+	depSample.imageMemoryBarrierCount = 1;
+	depSample.pImageMemoryBarriers    = &toSample;
+	vkCmdPipelineBarrier2(cmd, &depSample);
+
+	if (!swapchain->FlushOffscreenCommands()) {
+		DestroyImGuiPlaceholderTexture();
+		return false;
+	}
+
+	VkImageViewCreateInfo viewInfo{};
+	viewInfo.sType      = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	viewInfo.image      = imguiPlaceholderImage;
+	viewInfo.viewType   = VK_IMAGE_VIEW_TYPE_2D;
+	viewInfo.format     = VK_FORMAT_R8G8B8A8_UNORM;
+	viewInfo.subresourceRange = clearRange;
+
+	vr = vkCreateImageView(ctx->Device(), &viewInfo, nullptr, &imguiPlaceholderView);
+	if (vr != VK_SUCCESS) {
+		VkLogErr("vkCreateImageView (imguiPlaceholderView) failed (VkResult = %d)", (int)vr);
+		DestroyImGuiPlaceholderTexture();
+		return false;
+	}
+
+	VkSamplerCreateInfo sampInfo{};
+	sampInfo.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+	sampInfo.magFilter    = VK_FILTER_LINEAR;
+	sampInfo.minFilter    = VK_FILTER_LINEAR;
+	sampInfo.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+	sampInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	sampInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	sampInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	sampInfo.maxLod       = 1.0f;
+
+	vr = vkCreateSampler(ctx->Device(), &sampInfo, nullptr, &imguiPlaceholderSampler);
+	if (vr != VK_SUCCESS) {
+		VkLogErr("vkCreateSampler (imguiPlaceholderSampler) failed (VkResult = %d)", (int)vr);
+		DestroyImGuiPlaceholderTexture();
+		return false;
+	}
+
+	imguiPlaceholderDescSet = ImGui_ImplVulkan_AddTexture(
+		imguiPlaceholderSampler,
+		imguiPlaceholderView,
+		VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+	return imguiPlaceholderDescSet != VK_NULL_HANDLE;
+}
+
+void VulkanClient::DestroyImGuiPlaceholderTexture()
+{
+	if (imguiPlaceholderDescSet != VK_NULL_HANDLE) {
+		ImGui_ImplVulkan_RemoveTexture(imguiPlaceholderDescSet);
+		imguiPlaceholderDescSet = VK_NULL_HANDLE;
+	}
+	if (ctx && ctx->Device()) {
+		if (imguiPlaceholderSampler != VK_NULL_HANDLE) {
+			vkDestroySampler(ctx->Device(), imguiPlaceholderSampler, nullptr);
+			imguiPlaceholderSampler = VK_NULL_HANDLE;
+		}
+		if (imguiPlaceholderView != VK_NULL_HANDLE) {
+			vkDestroyImageView(ctx->Device(), imguiPlaceholderView, nullptr);
+			imguiPlaceholderView = VK_NULL_HANDLE;
+		}
+		if (imguiPlaceholderImage != VK_NULL_HANDLE) {
+			vmaDestroyImage(ctx->Allocator(), imguiPlaceholderImage, imguiPlaceholderAlloc);
+			imguiPlaceholderImage = VK_NULL_HANDLE;
+			imguiPlaceholderAlloc = VK_NULL_HANDLE;
+		}
+	}
 }
 
 void *VulkanClient::clbkGetExtendedInterface(const char *name)

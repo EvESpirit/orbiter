@@ -52,6 +52,7 @@ set(VKCLIENT_SOURCES
   VideoTab.cpp
   VulkanClient.cpp
   ${vk_bootstrap_SOURCE_DIR}/src/VkBootstrap.cpp
+  ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
 )
 
 set(VKCLIENT_HEADERS
@@ -88,6 +89,7 @@ target_compile_definitions(VulkanClient PRIVATE
   VULKANCLIENT_EXPORTS
   VK_NO_PROTOTYPES
   VK_USE_PLATFORM_WIN32_KHR
+  IMGUI_IMPL_VULKAN_USE_VOLK
   WIN32_LEAN_AND_MEAN
   NOMINMAX
   _CRT_SECURE_NO_WARNINGS

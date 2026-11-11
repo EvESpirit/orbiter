@@ -13,10 +13,12 @@
 #include "VkConfig.h"
 #include "VkContext.h"
 #include "VkSwapchain.h"
+#include "VkSurface.h"
 #include "VkLog.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 
@@ -26,15 +28,21 @@ namespace {
 HINSTANCE g_hInst = nullptr;
 VulkanClient *g_vkClient = nullptr;
 
-// STUB (Phase 1): Minimal surface token replaced by VkSurfNative in Phase 1
-struct VkPhase0SurfaceStub {
-	DWORD w = 256;
-	DWORD h = 256;
-	int refCount = 1;
-	bool managed = false;
-};
+std::string NormalizeTexKey(const char *fname)
+{
+	if (!fname)
+		return {};
+	std::string key(fname);
+	for (char &ch : key) {
+		if (ch == '/')
+			ch = '\\';
+		else
+			ch = (char)std::tolower((unsigned char)ch);
+	}
+	return key;
+}
 
-// STUB (Phase 1): Minimal font handle replaced by VkPadFont in Phase 1
+// STUB (Unit 1.3): Minimal font handle replaced by VkPadFont in Unit 1.3
 class VkPhase0FontStub : public oapi::Font {
 public:
 	VkPhase0FontStub(int height, bool prop, const char *face, FontStyle style, int orientation)
@@ -44,19 +52,19 @@ public:
 	int cellH;
 };
 
-// STUB (Phase 1): Minimal pen handle replaced by VkPadPen in Phase 1
+// STUB (Unit 1.3): Minimal pen handle replaced by VkPadPen in Unit 1.3
 class VkPhase0PenStub : public oapi::Pen {
 public:
 	VkPhase0PenStub(int style, int width, DWORD col) : oapi::Pen(style, width, col) {}
 };
 
-// STUB (Phase 1): Minimal brush handle replaced by VkPadBrush in Phase 1
+// STUB (Unit 1.3): Minimal brush handle replaced by VkPadBrush in Unit 1.3
 class VkPhase0BrushStub : public oapi::Brush {
 public:
 	explicit VkPhase0BrushStub(DWORD col) : oapi::Brush(col) {}
 };
 
-// STUB (Phase 1): Safe no-op Sketchpad replaced by VkPad in Phase 1.
+// STUB (Unit 1.3): Safe no-op Sketchpad replaced by VkPad in Unit 1.3.
 // Base oapi::Sketchpad methods contain assert(false) and vessels dereference
 // Sketchpad* during panel/MFD setup, so all virtual methods are safely stubbed.
 class VkPhase0SketchpadStub : public oapi::Sketchpad {
@@ -64,10 +72,12 @@ public:
 	VkPhase0SketchpadStub(SURFHANDLE s, DWORD defW, DWORD defH)
 		: oapi::Sketchpad(s), surfW(defW), surfH(defH)
 	{
-		if (s) {
-			const auto *st = reinterpret_cast<const VkPhase0SurfaceStub *>(s);
-			surfW = st->w;
-			surfH = st->h;
+		if (s && g_vkClient) {
+			const auto *st = reinterpret_cast<const VkSurfNative *>(s);
+			if (g_vkClient->IsValidSurface(st)) {
+				surfW = st->GetWidth();
+				surfH = st->GetHeight();
+			}
 		}
 	}
 
@@ -255,12 +265,10 @@ VulkanClient::~VulkanClient()
 {
 	if (imguiInitialized)
 		clbkImGuiShutdown();
+	DestroyAllSurfaces();
 	swapchain.reset();
 	ctx.reset();
 	stubParticleStreams.clear();
-	for (SURFHANDLE h : managedStubSurfaces)
-		delete reinterpret_cast<VkPhase0SurfaceStub *>(h);
-	managedStubSurfaces.clear();
 	vtab.reset();
 }
 
@@ -407,12 +415,19 @@ void VulkanClient::clbkPostCreation()
 
 void VulkanClient::clbkCloseSession(bool fastclose)
 {
-	// STUB (Phase 1): Release session stubs
 	(void)fastclose;
 	stubParticleStreams.clear();
-	for (SURFHANDLE h : managedStubSurfaces)
-		delete reinterpret_cast<VkPhase0SurfaceStub *>(h);
-	managedStubSurfaces.clear();
+}
+
+void VulkanClient::DestroyAllSurfaces()
+{
+	if (ctx && ctx->Device())
+		vkDeviceWaitIdle(ctx->Device());
+
+	sharedTextures.clear();
+	for (VkSurfNative *s : surfaceCatalog)
+		delete s;
+	surfaceCatalog.clear();
 }
 
 void VulkanClient::clbkDestroyRenderWindow(bool fastclose)
@@ -420,8 +435,8 @@ void VulkanClient::clbkDestroyRenderWindow(bool fastclose)
 	VkLogAlw("================ clbkDestroyRenderWindow ================");
 	if (imguiInitialized)
 		clbkImGuiShutdown();
+	DestroyAllSurfaces();
 	GraphicsClient::clbkDestroyRenderWindow(fastclose);
-	// Called from WM_DESTROY after all session surfaces were released; HWND is still valid
 	swapchain.reset();
 	ctx.reset();
 }
@@ -532,6 +547,9 @@ void VulkanClient::clbkImGuiShutdown()
 	if (ctx && ctx->Device())
 		vkDeviceWaitIdle(ctx->Device());
 
+	for (VkSurfNative *s : surfaceCatalog)
+		s->ReleaseImGuiDescriptorSet();
+
 	DestroyImGuiPlaceholderTexture();
 	ImGui_ImplVulkan_Shutdown();
 
@@ -562,9 +580,15 @@ void VulkanClient::clbkImGuiRenderDrawData()
 
 uint64_t VulkanClient::clbkImGuiSurfaceTexture(SURFHANDLE surf)
 {
-	// STUB (Phase 1): Return per-surface VkSurfNative descriptor set once implemented
-	(void)surf;
-	return (uint64_t)imguiPlaceholderDescSet;
+	if (!surf || !imguiInitialized || imguiPlaceholderSampler == VK_NULL_HANDLE)
+		return (uint64_t)imguiPlaceholderDescSet;
+
+	auto *s = reinterpret_cast<VkSurfNative *>(surf);
+	if (surfaceCatalog.count(s) == 0)
+		return (uint64_t)imguiPlaceholderDescSet;
+
+	VkDescriptorSet ds = s->GetImGuiDescriptorSet(imguiPlaceholderSampler);
+	return ds != VK_NULL_HANDLE ? (uint64_t)ds : (uint64_t)imguiPlaceholderDescSet;
 }
 
 bool VulkanClient::CreateImGuiPlaceholderTexture()
@@ -728,115 +752,215 @@ void *VulkanClient::clbkGetExtendedInterface(const char *name)
 }
 
 // ==============================================================
-// Phase 0 Surface / 2D / Particle Placeholders
+// Surface & Texture Management (Unit 1.1)
 // ==============================================================
 
 SURFHANDLE VulkanClient::clbkLoadTexture(const char *fname, DWORD flags)
 {
-	// STUB (Phase 1): Texture loader
-	(void)fname;
-	auto *s = new VkPhase0SurfaceStub{ 256, 256, 1, (flags & 0x8) != 0 };
-	if (s->managed)
-		managedStubSurfaces.push_back(reinterpret_cast<SURFHANDLE>(s));
-	return reinterpret_cast<SURFHANDLE>(s);
+	DWORD attrib = OAPISURFACE_TEXTURE;
+	if (flags & 0x1) attrib |= OAPISURFACE_SYSMEM;
+	if (flags & 0x2) attrib |= OAPISURFACE_UNCOMPRESS | OAPISURFACE_RENDERTARGET;
+	if (flags & 0x4) attrib |= OAPISURFACE_NOMIPMAPS;
+	if (flags & 0x8) attrib |= OAPISURFACE_SHARED;
+
+	return clbkLoadSurface(fname, attrib, false);
 }
 
 SURFHANDLE VulkanClient::clbkLoadSurface(const char *fname, DWORD attrib, bool bPath)
 {
-	// STUB (Phase 1): Surface loader
-	(void)fname;
-	(void)attrib;
-	(void)bPath;
-	auto *s = new VkPhase0SurfaceStub{ 256, 256, 1, false };
-	return reinterpret_cast<SURFHANDLE>(s);
+	if (!ctx || !swapchain || !fname || !fname[0])
+		return nullptr;
+
+	constexpr DWORD kNonShareableMask = OAPISURFACE_RENDERTARGET | OAPISURFACE_GDI | OAPISURFACE_SYSMEM;
+	const bool shareable = ((attrib & kNonShareableMask) == 0) && ((attrib & OAPISURFACE_SHARED) != 0);
+
+	std::string key;
+	if (shareable) {
+		key = NormalizeTexKey(fname);
+		auto it = sharedTextures.find(key);
+		if (it != sharedTextures.end())
+			return reinterpret_cast<SURFHANDLE>(it->second);
+	}
+
+	VkSurfNative *surf = VkSurfNative::LoadFromFile(*this, *ctx, *swapchain, fname, attrib, bPath);
+	if (!surf)
+		return nullptr;
+
+	surfaceCatalog.insert(surf);
+	if (shareable) {
+		surf->SetManaged(true);
+		sharedTextures[key] = surf;
+	}
+	return reinterpret_cast<SURFHANDLE>(surf);
 }
 
 void VulkanClient::clbkReleaseTexture(SURFHANDLE hTex)
 {
-	// STUB (Phase 1)
 	clbkReleaseSurface(hTex);
 }
 
 SURFHANDLE VulkanClient::clbkCreateSurfaceEx(DWORD w, DWORD h, DWORD attrib)
 {
-	// STUB (Phase 1): Surface allocator
-	(void)attrib;
-	auto *s = new VkPhase0SurfaceStub{ w ? w : 1, h ? h : 1, 1, false };
-	return reinterpret_cast<SURFHANDLE>(s);
+	if (!ctx || !swapchain || w == 0 || h == 0)
+		return nullptr;
+
+	VkSurfNative *surf = VkSurfNative::Create(*ctx, *swapchain, w, h, attrib);
+	if (!surf)
+		return nullptr;
+
+	surf->SetName("clbkCreateSurfaceEx");
+	surfaceCatalog.insert(surf);
+	return reinterpret_cast<SURFHANDLE>(surf);
 }
 
 SURFHANDLE VulkanClient::clbkCreateSurface(DWORD w, DWORD h, SURFHANDLE hTemplate)
 {
-	// STUB (Phase 1)
-	(void)hTemplate;
-	return clbkCreateSurfaceEx(w, h, 0);
+	if (!ctx || !swapchain || w == 0 || h == 0)
+		return nullptr;
+
+	DWORD attrib = OAPISURFACE_PF_XRGB | OAPISURFACE_RENDERTARGET | OAPISURFACE_TEXTURE;
+	if (hTemplate) {
+		auto *tmpl = reinterpret_cast<VkSurfNative *>(hTemplate);
+		if (surfaceCatalog.count(tmpl))
+			attrib = tmpl->GetOAPIFlags();
+	}
+
+	VkSurfNative *surf = VkSurfNative::Create(*ctx, *swapchain, w, h, attrib);
+	if (!surf)
+		return nullptr;
+
+	surf->SetName("clbkCreateSurface");
+	surfaceCatalog.insert(surf);
+	return reinterpret_cast<SURFHANDLE>(surf);
+}
+
+SURFHANDLE VulkanClient::clbkCreateSurface(HBITMAP hBmp)
+{
+	if (!ctx || !swapchain || !hBmp)
+		return nullptr;
+
+	SURFHANDLE hSurf = GraphicsClient::clbkCreateSurface(hBmp);
+	if (hSurf) {
+		auto *s = reinterpret_cast<VkSurfNative *>(hSurf);
+		if (surfaceCatalog.count(s))
+			s->SetName("clbkCreateSurface_HBITMAP");
+	}
+	return hSurf;
 }
 
 SURFHANDLE VulkanClient::clbkCreateTexture(DWORD w, DWORD h)
 {
-	// STUB (Phase 1)
-	return clbkCreateSurfaceEx(w, h, 0);
+	if (!ctx || !swapchain || w == 0 || h == 0)
+		return nullptr;
+
+	VkSurfNative *surf = VkSurfNative::Create(
+		*ctx,
+		*swapchain,
+		w,
+		h,
+		OAPISURFACE_PF_XRGB | OAPISURFACE_RENDERTARGET | OAPISURFACE_TEXTURE);
+	if (!surf)
+		return nullptr;
+
+	surf->SetName("clbkCreateTexture");
+	surfaceCatalog.insert(surf);
+	return reinterpret_cast<SURFHANDLE>(surf);
 }
 
 void VulkanClient::clbkIncrSurfaceRef(SURFHANDLE surf)
 {
-	// STUB (Phase 1)
 	if (!surf)
 		return;
-	auto *s = reinterpret_cast<VkPhase0SurfaceStub *>(surf);
-	++s->refCount;
+	auto *s = reinterpret_cast<VkSurfNative *>(surf);
+	if (surfaceCatalog.count(s))
+		s->IncRef();
 }
 
 bool VulkanClient::clbkReleaseSurface(SURFHANDLE surf)
 {
-	// STUB (Phase 1)
 	if (!surf)
 		return false;
-	auto *s = reinterpret_cast<VkPhase0SurfaceStub *>(surf);
-	if (s->managed)
-		return true;
-	if (--s->refCount <= 0)
+	auto *s = reinterpret_cast<VkSurfNative *>(surf);
+	auto it = surfaceCatalog.find(s);
+	if (it == surfaceCatalog.end())
+		return false;
+
+	if (s->IsManaged() || (s->GetOAPIFlags() & OAPISURFACE_ORIGIN))
+		return false;
+
+	if (s->DecRef()) {
+		surfaceCatalog.erase(it);
 		delete s;
-	return true;
+		return true;
+	}
+	return false;
 }
 
 bool VulkanClient::clbkGetSurfaceSize(SURFHANDLE surf, DWORD *w, DWORD *h)
 {
-	// STUB (Phase 1)
+	if (!w || !h)
+		return false;
 	if (!surf) {
-		if (w) *w = viewW;
-		if (h) *h = viewH;
+		*w = viewW;
+		*h = viewH;
 		return true;
 	}
-	const auto *s = reinterpret_cast<const VkPhase0SurfaceStub *>(surf);
-	if (w) *w = s->w;
-	if (h) *h = s->h;
+	const auto *s = reinterpret_cast<const VkSurfNative *>(surf);
+	if (surfaceCatalog.count(const_cast<VkSurfNative *>(s)) == 0)
+		return false;
+	*w = s->GetWidth();
+	*h = s->GetHeight();
 	return true;
+}
+
+bool VulkanClient::clbkSetSurfaceColourKey(SURFHANDLE surf, DWORD ckey)
+{
+	if (!surf)
+		return false;
+	auto *s = reinterpret_cast<VkSurfNative *>(surf);
+	if (surfaceCatalog.count(s) == 0)
+		return false;
+	s->SetColorKey(ckey);
+	return true;
+}
+
+DWORD VulkanClient::clbkGetDeviceColour(BYTE r, BYTE g, BYTE b)
+{
+	return ((DWORD)r << 16) | ((DWORD)g << 8) | (DWORD)b;
 }
 
 bool VulkanClient::clbkCopyBitmap(SURFHANDLE pdds, HBITMAP hbm, int x, int y, int dx, int dy)
 {
-	// STUB (Phase 1)
-	(void)pdds;
-	(void)hbm;
-	(void)x;
-	(void)y;
-	(void)dx;
-	(void)dy;
-	return true;
+	if (!pdds || !hbm)
+		return false;
+	auto *s = reinterpret_cast<VkSurfNative *>(pdds);
+	if (surfaceCatalog.count(s) == 0)
+		return false;
+	if (s->CopyFromHBITMAP(hbm, x, y, dx, dy)) {
+		s->SetName("clbkCopyBitmap");
+		return true;
+	}
+	return false;
 }
 
 bool VulkanClient::clbkSaveSurfaceToImage(SURFHANDLE surf, const char *fname, ImageFileFormat fmt, float quality)
 {
-	// STUB (Phase 1): Non-null SURFHANDLE readback awaits VkSurfNative; surf == nullptr reads sceneImage
-	(void)surf;
 	if (!swapchain)
 		return false;
 
 	std::vector<uint8_t> bgra;
 	uint32_t w = 0, h = 0;
-	if (!swapchain->ReadbackSceneTarget(bgra, w, h) || w == 0 || h == 0)
-		return false;
+
+	if (!surf) {
+		if (!swapchain->ReadbackSceneTarget(bgra, w, h) || w == 0 || h == 0)
+			return false;
+	} else {
+		auto *s = reinterpret_cast<VkSurfNative *>(surf);
+		if (surfaceCatalog.count(s) == 0)
+			return false;
+		if (!s->ReadbackBgra(bgra, w, h) || w == 0 || h == 0)
+			return false;
+	}
 
 	if (!fname) {
 		HWND hWnd = GetRenderWindow();
@@ -891,27 +1015,31 @@ bool VulkanClient::clbkSaveSurfaceToImage(SURFHANDLE surf, const char *fname, Im
 	return WriteImageDataToFile(id, fname, fmt, quality);
 }
 
+// ==============================================================
+// Phase 1 (Unit 1.3) / Phase 4 Placeholders
+// ==============================================================
+
 Sketchpad *VulkanClient::clbkGetSketchpad(SURFHANDLE surf)
 {
-	// STUB (Phase 1)
+	// STUB (Unit 1.3)
 	return new VkPhase0SketchpadStub(surf, viewW, viewH);
 }
 
 void VulkanClient::clbkReleaseSketchpad(Sketchpad *sp)
 {
-	// STUB (Phase 1)
+	// STUB (Unit 1.3)
 	delete sp;
 }
 
 Font *VulkanClient::clbkCreateFont(int height, bool prop, const char *face, FontStyle style, int orientation) const
 {
-	// STUB (Phase 1)
+	// STUB (Unit 1.3)
 	return new VkPhase0FontStub(height, prop, face ? face : "Sans", style, orientation);
 }
 
 Font *VulkanClient::clbkCreateFontEx(int height, char *face, int width, int weight, FontStyle style, float spacing) const
 {
-	// STUB (Phase 1)
+	// STUB (Unit 1.3)
 	(void)width;
 	(void)weight;
 	(void)spacing;
@@ -920,31 +1048,31 @@ Font *VulkanClient::clbkCreateFontEx(int height, char *face, int width, int weig
 
 void VulkanClient::clbkReleaseFont(Font *font) const
 {
-	// STUB (Phase 1)
+	// STUB (Unit 1.3)
 	delete font;
 }
 
 Pen *VulkanClient::clbkCreatePen(int style, int width, DWORD col) const
 {
-	// STUB (Phase 1)
+	// STUB (Unit 1.3)
 	return new VkPhase0PenStub(style, width, col);
 }
 
 void VulkanClient::clbkReleasePen(Pen *pen) const
 {
-	// STUB (Phase 1)
+	// STUB (Unit 1.3)
 	delete pen;
 }
 
 Brush *VulkanClient::clbkCreateBrush(DWORD col) const
 {
-	// STUB (Phase 1)
+	// STUB (Unit 1.3)
 	return new VkPhase0BrushStub(col);
 }
 
 void VulkanClient::clbkReleaseBrush(Brush *brush) const
 {
-	// STUB (Phase 1)
+	// STUB (Unit 1.3)
 	delete brush;
 }
 

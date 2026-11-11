@@ -49,6 +49,7 @@ set(VKCLIENT_SOURCES
   VkConfig.cpp
   VkContext.cpp
   VkSwapchain.cpp
+  VkSurface.cpp
   VideoTab.cpp
   VulkanClient.cpp
   ${vk_bootstrap_SOURCE_DIR}/src/VkBootstrap.cpp
@@ -62,6 +63,7 @@ set(VKCLIENT_HEADERS
   VkConfig.h
   VkContext.h
   VkSwapchain.h
+  VkSurface.h
   VideoTab.h
   VulkanClient.h
 )
@@ -128,6 +130,7 @@ target_link_libraries(VulkanClient PRIVATE
   imm32.lib
   version.lib
   msimg32.lib
+  windowscodecs.lib
 )
 
 set_target_properties(VulkanClient PROPERTIES

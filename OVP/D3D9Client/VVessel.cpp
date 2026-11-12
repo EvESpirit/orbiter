@@ -816,11 +816,17 @@ bool vVessel::Render(LPDIRECT3DDEVICE9 dev, bool internalpass)
 			if ((flags&DBG_FLAGS_BOXES || Config->bShowVesselColliders) && !internalpass) {
 				RenderColliders();
 			}
+			if (Config->bShowDockingDebug && !internalpass) {
+				RenderDockingDebug();
+			}
 
 			RenderLightCone(&mWorld);
 		} else {
 			if (Config->bShowVesselColliders && !internalpass) {
 				RenderColliders();
+			}
+			if (Config->bShowDockingDebug && !internalpass) {
+				RenderDockingDebug();
 			}
 		}
 	}
@@ -948,6 +954,176 @@ void vVessel::RenderColliders()
 			VECTOR3 rArm = _V(0,1,0); if (fabs(nArm.y) > 0.99) rArm = _V(1,0,0);
 			rArm = unit(crossp(nArm, rArm));
 			D3D9Effect::RenderArrow(vessel->GetHandle(), &zro, &nArm, &rArm, min(0.5f, (float)length(cArm)), ptr(D3DXCOLOR(0, 1, 0, 1)));
+		}
+	}
+}
+
+// ============================================================================================
+// Render dedicated 3D docking clear-zone cylinders, clear-zone sub-hulls, port axes, and approach lines
+//
+void vVessel::RenderDockingDebug()
+{
+	DWORD activeDockMask = 0, nTotalSlices = 0, nClearSlices = 0;
+	int hitSliceA = -1, hitMeshA = -1, hitGroupA = -1;
+	OBJHANDLE hHitOther = NULL;
+	vessel->GetDockingCollisionDebug(activeDockMask, nTotalSlices, nClearSlices, hitSliceA, hitMeshA, hitGroupA, hHitOther);
+
+	// 1. Render the actual convex sub-hull wireframes of the Clear-Zone slices
+	//    Colored Bright Gold if any port on this vessel is in active approach, or Cyan if idle
+	DWORD nPts = 0;
+	const VECTOR3 *pts = vessel->GetCollisionPointCloud(nPts);
+	DWORD nClearIdx = 0;
+	const WORD *clearIdx = vessel->GetCollisionClearZoneHullIndices(nClearIdx);
+
+	D3DCOLOR clearHullColor = (activeDockMask != 0)
+		? D3DCOLOR_RGBA(255, 220, 0, 220)   // Gold/Yellow: Clear zone actively suppressed!
+		: D3DCOLOR_RGBA(0, 220, 255, 160);  // Cyan: Clear zone idle
+
+	if (pts && nPts > 0 && clearIdx && nClearIdx > 0) {
+		std::vector<D3DXVECTOR3> dbgVtx(nPts);
+		for (DWORD i = 0; i < nPts; i++) {
+			dbgVtx[i] = D3DXVECTOR3((float)pts[i].x, (float)pts[i].y, (float)pts[i].z);
+		}
+		std::vector<WORD> dbgIdx;
+		dbgIdx.reserve(nClearIdx * 2);
+		for (DWORD i = 0; i < nClearIdx; i += 3) {
+			dbgIdx.push_back(clearIdx[i]);   dbgIdx.push_back(clearIdx[i+1]);
+			dbgIdx.push_back(clearIdx[i+1]); dbgIdx.push_back(clearIdx[i+2]);
+			dbgIdx.push_back(clearIdx[i+2]); dbgIdx.push_back(clearIdx[i]);
+		}
+		D3D9Effect::RenderLines(dbgVtx.data(), dbgIdx.data(), dbgVtx.size(), dbgIdx.size(), &mWorld, clearHullColor);
+	}
+
+	// 2. Render Clear-Zone AABB boxes
+	DWORD nBoxes = 0;
+	const VECTOR3* clearZones = vessel->GetCollisionClearZones(nBoxes);
+	if (clearZones && nBoxes > 0) {
+		D3DXMATRIX id;
+		D3DXMatrixIdentity(&id);
+		D3DXVECTOR4 boxCol = (activeDockMask != 0)
+			? D3DXVECTOR4(1.0f, 0.85f, 0.0f, 0.85f)
+			: D3DXVECTOR4(0.0f, 0.9f, 1.0f, 0.65f);
+		for (DWORD i = 0; i < nBoxes; i++) {
+			D3DXVECTOR4 bmin((float)clearZones[i*2].x, (float)clearZones[i*2].y, (float)clearZones[i*2].z, 1.0f);
+			D3DXVECTOR4 bmax((float)clearZones[i*2+1].x, (float)clearZones[i*2+1].y, (float)clearZones[i*2+1].z, 1.0f);
+			D3D9Effect::RenderBoundingBox(&mWorld, &id, &bmin, &bmax, &boxCol);
+		}
+	}
+
+	// 3. For each docking port, render the 3D Clear-Zone Cylinder, 0.3m Capture Ring, and Dir/Rot Arrows
+	double cylRadius = 2.2, cylZMin = -1.5, cylZMax = 2.5;
+	vessel->GetDockClearCylinderParams(cylRadius, cylZMin, cylZMax);
+
+	DWORD nDocks = vessel->DockCount();
+	for (DWORD d = 0; d < nDocks; d++) {
+		DOCKHANDLE hDock = vessel->GetDockHandle(d);
+		if (!hDock) continue;
+
+		VECTOR3 pos, dir, rot;
+		vessel->GetDockParams(hDock, pos, dir, rot);
+
+		bool isDocked = (vessel->GetDockStatus(hDock) != NULL);
+		bool isApproaching = ((activeDockMask & (1u << d)) != 0);
+
+		D3DCOLOR portColor = isDocked
+			? D3DCOLOR_RGBA(180, 80, 255, 160) // Purple: Docked
+			: (isApproaching ? D3DCOLOR_RGBA(50, 255, 50, 240) : D3DCOLOR_RGBA(0, 200, 255, 180));
+
+		// Build orthonormal basis (dir, u, v) in vessel-local space
+		VECTOR3 nDir = unit(dir);
+		VECTOR3 uVec = rot - nDir * dotp(rot, nDir);
+		if (length(uVec) > 1e-6) uVec = unit(uVec);
+		else uVec = _V(1, 0, 0);
+		VECTOR3 vVec = unit(crossp(nDir, uVec));
+
+		// Generate wireframe cylinder + 0.3m MIN_DOCK_DIST capture circle
+		const int NSEG = 16;
+		std::vector<D3DXVECTOR3> cylVtx;
+		std::vector<WORD> cylIdx;
+		cylVtx.reserve(NSEG * 3 + 2);
+
+		for (int s = 0; s < NSEG; s++) {
+			double ang = (2.0 * PI * s) / NSEG;
+			double ca = cos(ang), sa = sin(ang);
+			VECTOR3 radial = (uVec * ca + vVec * sa) * cylRadius;
+			VECTOR3 pBack  = pos + nDir * cylZMin + radial;
+			VECTOR3 pFront = pos + nDir * cylZMax + radial;
+			VECTOR3 pCap   = pos + (uVec * ca + vVec * sa) * 0.30; // MIN_DOCK_DIST = 0.3m ring
+
+			cylVtx.push_back(D3DXVECTOR3((float)pBack.x,  (float)pBack.y,  (float)pBack.z));
+			cylVtx.push_back(D3DXVECTOR3((float)pFront.x, (float)pFront.y, (float)pFront.z));
+			cylVtx.push_back(D3DXVECTOR3((float)pCap.x,   (float)pCap.y,   (float)pCap.z));
+		}
+
+		for (int s = 0; s < NSEG; s++) {
+			int next = (s + 1) % NSEG;
+			WORD b0 = (WORD)(s * 3 + 0), f0 = (WORD)(s * 3 + 1), c0 = (WORD)(s * 3 + 2);
+			WORD b1 = (WORD)(next * 3 + 0), f1 = (WORD)(next * 3 + 1), c1 = (WORD)(next * 3 + 2);
+
+			// Back ring, front ring, and capture ring
+			cylIdx.push_back(b0); cylIdx.push_back(b1);
+			cylIdx.push_back(f0); cylIdx.push_back(f1);
+			cylIdx.push_back(c0); cylIdx.push_back(c1);
+
+			// Longitudinal struts every 2 segments
+			if (s % 2 == 0) {
+				cylIdx.push_back(b0); cylIdx.push_back(f0);
+			}
+		}
+
+		D3D9Effect::RenderLines(cylVtx.data(), cylIdx.data(), cylVtx.size(), cylIdx.size(), &mWorld, portColor);
+
+		// Draw approach direction arrow (dir) and alignment arrow (rot)
+		D3DXCOLOR arrowCol = isApproaching ? D3DXCOLOR(0.2f, 1.0f, 0.2f, 1.0f) : D3DXCOLOR(0.0f, 0.85f, 1.0f, 1.0f);
+		D3D9Effect::RenderArrow(vessel->GetHandle(), &pos, &nDir, &uVec, 0.4f, &arrowCol);
+		D3DXCOLOR rotCol(1.0f, 0.6f, 0.0f, 1.0f);
+		D3D9Effect::RenderArrow(vessel->GetHandle(), &pos, &uVec, &nDir, 0.25f, &rotCol);
+
+		// 4. Draw 3D tether line to any nearby free docking port (< 25m) on another vessel
+		if (!isDocked) {
+			VECTOR3 gPosA, gDirA;
+			vessel->Local2Global(pos, gPosA);
+			vessel->Local2Global(pos + nDir, gDirA);
+			gDirA = unit(gDirA - gPosA);
+
+			DWORD nVessels = oapiGetVesselCount();
+			for (DWORD vi = 0; vi < nVessels; vi++) {
+				OBJHANDLE hOther = oapiGetVesselByIndex(vi);
+				if (!hOther || hOther == vessel->GetHandle()) continue;
+				VESSEL *vOther = oapiGetVesselInterface(hOther);
+				if (!vOther) continue;
+
+				for (DWORD dj = 0; dj < vOther->DockCount(); dj++) {
+					DOCKHANDLE hDockB = vOther->GetDockHandle(dj);
+					if (!hDockB || vOther->GetDockStatus(hDockB) != NULL) continue;
+
+					VECTOR3 posB, dirB, rotB, gPosB, gDirB;
+					vOther->GetDockParams(hDockB, posB, dirB, rotB);
+					vOther->Local2Global(posB, gPosB);
+					vOther->Local2Global(posB + unit(dirB), gDirB);
+					gDirB = unit(gDirB - gPosB);
+
+					VECTOR3 ab = gPosB - gPosA;
+					double dist = length(ab);
+					if (dist < 25.0 && dist > 1e-4) {
+						bool dirOk = (dotp(gDirA, gDirB) < -0.8);
+						bool frontOk = (dist < 0.5) || (dotp(ab / dist, gDirA) > 0.5 && dotp(ab / dist, gDirB) < -0.5);
+						bool allPass = (dist < 5.0 && dirOk && frontOk);
+
+						VECTOR3 targetInLocalA;
+						vessel->Global2Local(gPosB, targetInLocalA);
+						D3DXVECTOR3 linePts[2] = {
+							D3DXVECTOR3((float)pos.x, (float)pos.y, (float)pos.z),
+							D3DXVECTOR3((float)targetInLocalA.x, (float)targetInLocalA.y, (float)targetInLocalA.z)
+						};
+						WORD lineIdx[2] = { 0, 1 };
+						D3DCOLOR tetherCol = allPass
+							? D3DCOLOR_RGBA(50, 255, 50, 255)   // Green: Approach declared!
+							: D3DCOLOR_RGBA(255, 120, 0, 220);  // Orange: Within 25m, not yet in approach state
+						D3D9Effect::RenderLines(linePts, lineIdx, 2, 2, &mWorld, tetherCol);
+					}
+				}
+			}
 		}
 	}
 }

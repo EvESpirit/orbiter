@@ -89,6 +89,16 @@ public:
 	bool CopyFromHBITMAP(HBITMAP hbm, int srcX, int srcY, int srcW, int srcH);
 	bool ReadbackBgra(std::vector<uint8_t> &outBgra, uint32_t &outWidth, uint32_t &outHeight);
 	bool Decompress();
+	bool Fill(const RECT *rect, DWORD col);
+	HDC GetDC();
+	void ReleaseDC(HDC hDC);
+
+	bool EnsureTempBlitImage();
+	VkImage GetTempBlitImage() const { return tempBlitImage; }
+	VkImageView GetTempBlitView() const { return tempBlitView; }
+	VkImageView GetRenderTargetView();
+	void RegenerateMipmaps(VkCommandBuffer cmd);
+	void MarkGpuDirty() { gpuDirty = true; }
 
 	void TransitionLayout(
 		VkCommandBuffer cmd,
@@ -166,6 +176,7 @@ private:
 		const std::vector<size_t> &mipSizes);
 
 	void DestroyGpuResources();
+	void DestroyGdiResources();
 
 	VkContext *ctx = nullptr;
 	VkSwapchain *swapchain = nullptr;
@@ -188,12 +199,25 @@ private:
 	VkImage image = VK_NULL_HANDLE;
 	VmaAllocation allocation = VK_NULL_HANDLE;
 	VkImageView imageView = VK_NULL_HANDLE;
+	VkImageView rtMip0View = VK_NULL_HANDLE;
 	VkImageLayout currentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+	VkImage tempBlitImage = VK_NULL_HANDLE;
+	VmaAllocation tempBlitAlloc = VK_NULL_HANDLE;
+	VkImageView tempBlitView = VK_NULL_HANDLE;
 
 	VkImage depthImage = VK_NULL_HANDLE;
 	VmaAllocation depthAlloc = VK_NULL_HANDLE;
 	VkImageView depthView = VK_NULL_HANDLE;
 	VkFormat depthFormat = VK_FORMAT_D24_UNORM_S8_UINT;
+
+	HDC gdiMemDC = nullptr;
+	HBITMAP gdiBitmap = nullptr;
+	HGDIOBJ gdiOldObj = nullptr;
+	uint8_t *gdiBits = nullptr;
+	bool gdiOpen = false;
+	bool gpuDirty = false;
+	std::vector<uint8_t> gdiPreSnapshot;
 
 	VkDescriptorSet imguiDescSet = VK_NULL_HANDLE;
 	VkSurfNative *pMap[MAP_MAX_COUNT]{};

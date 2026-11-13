@@ -13,12 +13,14 @@
 #include "VkConfig.h"
 #include "VkContext.h"
 #include "VkSwapchain.h"
+#include "VkBlit.h"
 #include "VkSurface.h"
 #include "VkLog.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 
@@ -266,6 +268,7 @@ VulkanClient::~VulkanClient()
 	if (imguiInitialized)
 		clbkImGuiShutdown();
 	DestroyAllSurfaces();
+	blitter.reset();
 	swapchain.reset();
 	ctx.reset();
 	stubParticleStreams.clear();
@@ -361,11 +364,25 @@ HWND VulkanClient::clbkCreateRenderWindow()
 		VkLogErr("Render window creation failed");
 		return NULL;
 	}
+	renderWnd = hWnd;
+	bltGroupTgt = RENDERTGT_NONE;
 	SetWindowTextA(hWnd, "[VulkanClient]");
 
 	if (data->fullscreen)
 		ApplyBorderlessWindow(hWnd, data);
 	UpdateViewportSize(hWnd);
+
+	RECT rcClient{};
+	if (GetClientRect(hWnd, &rcClient)) {
+		HDC hdcWnd = ::GetDC(hWnd);
+		if (hdcWnd) {
+			HBRUSH hBlack = (HBRUSH)GetStockObject(BLACK_BRUSH);
+			FillRect(hdcWnd, &rcClient, hBlack);
+			::ReleaseDC(hWnd, hdcWnd);
+		}
+		ValidateRect(hWnd, nullptr);
+	}
+
 	VkLogInfo("Render window %ux%u (%s)", viewW, viewH, data->fullscreen ? "borderless" : "windowed");
 
 	ctx = std::make_unique<VkContext>();
@@ -390,13 +407,129 @@ HWND VulkanClient::clbkCreateRenderWindow()
 		return hWnd;
 	}
 
+	blitter = std::make_unique<VkBlitPipeline>();
+	if (!blitter->Create(*ctx)) {
+		blitter.reset();
+		VkLogWarn("VkBlitPipeline creation failed; scaled/color-keyed blits are disabled");
+	}
+
 	viewW = swapchain->Extent().width;
 	viewH = swapchain->Extent().height;
 
-	// Present an initial cleared frame immediately so the window is not white during world load
-	swapchain->Present(hWnd);
+	RenderSplashScreen(hWnd);
 
 	return hWnd;
+}
+
+void VulkanClient::clbkSetSplashScreen(const char *fname, DWORD textCol)
+{
+	customSplashPath = fname ? fname : "";
+	customSplashCol  = textCol;
+}
+
+void VulkanClient::RenderSplashScreen(HWND hWnd)
+{
+	if (!swapchain || !swapchain->IsValid() || viewW == 0 || viewH == 0)
+		return;
+
+	swapchain->FillScene(nullptr, 0);
+
+	SURFHANDLE splashSurf = nullptr;
+	DWORD imgW = 0, imgH = 0;
+
+	if (!customSplashPath.empty()) {
+		splashSurf = clbkLoadSurface(customSplashPath.c_str(), OAPISURFACE_UNCOMPRESS | OAPISURFACE_RENDERTARGET | OAPISURFACE_TEXTURE, true);
+		if (splashSurf)
+			clbkGetSurfaceSize(splashSurf, &imgW, &imgH);
+	}
+
+	if (!splashSurf) {
+		HMODULE hOrbiter = GetModuleHandleA(nullptr);
+		HRSRC hRes = FindResourceA(hOrbiter, MAKEINTRESOURCEA(292), "IMAGE");
+		if (hRes) {
+			HGLOBAL hGlob = LoadResource(hOrbiter, hRes);
+			auto *pData = static_cast<BYTE *>(LockResource(hGlob));
+			DWORD nSize = SizeofResource(hOrbiter, hRes);
+			if (pData && nSize > 0) {
+				const double scale = std::min((double)viewW / 1920.0, (double)viewH / 1200.0);
+				const DWORD bmw = std::max<DWORD>(1, (DWORD)(1920.0 * scale + 0.5));
+				const DWORD bmh = std::max<DWORD>(1, (DWORD)(1200.0 * scale + 0.5));
+				HBITMAP hbm = ReadImageFromMemory(pData, nSize, bmw, bmh);
+				if (hbm) {
+					splashSurf = clbkCreateSurface(hbm);
+					DeleteObject(hbm);
+					if (splashSurf)
+						clbkGetSurfaceSize(splashSurf, &imgW, &imgH);
+				}
+			}
+		}
+	}
+
+	if (splashSurf && imgW > 0 && imgH > 0) {
+		HDC hDC = clbkGetSurfaceDC(splashSurf);
+		if (hDC) {
+			LOGFONTA lf{};
+			lf.lfHeight        = 18;
+			lf.lfWeight        = FW_BOLD;
+			lf.lfCharSet       = ANSI_CHARSET;
+			lf.lfOutPrecision  = OUT_DEFAULT_PRECIS;
+			lf.lfClipPrecision = CLIP_DEFAULT_PRECIS;
+			lf.lfQuality       = ANTIALIASED_QUALITY;
+			strcpy_s(lf.lfFaceName, "Courier New");
+
+			HFONT hFont = CreateFontIndirectA(&lf);
+			HGDIOBJ hOld = hFont ? SelectObject(hDC, hFont) : nullptr;
+			SetTextColor(hDC, (COLORREF)customSplashCol);
+			SetBkMode(hDC, TRANSPARENT);
+
+			static const char *const kMonths[] = {
+				"???", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+				"Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+			};
+			DWORD ver = oapiGetOrbiterVersion();
+			const DWORD yr = ver / 10000;
+			ver -= yr * 10000;
+			DWORD mo = ver / 100;
+			const DWORD dy = ver - mo * 100;
+			if (mo > 12)
+				mo = 0;
+
+			char buildLine[128]{};
+			std::snprintf(buildLine, sizeof(buildLine), "Build %s %lu 20%lu [%u]",
+				kMonths[mo], (unsigned long)dy, (unsigned long)yr, oapiGetOrbiterVersion());
+
+#ifdef _DEBUG
+			const char *clientLine = "VulkanClient (Vulkan 1.3 Debug Build)";
+#else
+			const char *clientLine = "VulkanClient (Vulkan 1.3 Release Build)";
+#endif
+
+			const int xc = (int)(imgW * 750u / 1280u);
+			const int yc = (int)(imgH * 545u / 800u);
+			TextOutA(hDC, xc, yc + 0 * 20, "ORBITER Space Flight Simulator", 30);
+			TextOutA(hDC, xc, yc + 1 * 20, buildLine, (int)std::strlen(buildLine));
+			TextOutA(hDC, xc, yc + 2 * 20, clientLine, (int)std::strlen(clientLine));
+
+			if (hOld)
+				SelectObject(hDC, hOld);
+			if (hFont)
+				DeleteObject(hFont);
+			clbkReleaseSurfaceDC(splashSurf, hDC);
+		}
+
+		const double scale = std::min((double)viewW / (double)imgW, (double)viewH / (double)imgH);
+		const DWORD tgtW = std::max<DWORD>(1, (DWORD)(imgW * scale + 0.5));
+		const DWORD tgtH = std::max<DWORD>(1, (DWORD)(imgH * scale + 0.5));
+		const DWORD tgtX = (viewW > tgtW) ? (viewW - tgtW) / 2 : 0;
+		const DWORD tgtY = (viewH > tgtH) ? (viewH - tgtH) / 2 : 0;
+
+		clbkScaleBlt(RENDERTGT_MAINWINDOW, tgtX, tgtY, tgtW, tgtH, splashSurf, 0, 0, imgW, imgH, 0);
+		swapchain->FlushOffscreenCommands();
+		clbkReleaseSurface(splashSurf);
+	}
+
+	swapchain->FlushOffscreenCommands();
+	swapchain->Present(hWnd);
 }
 
 void VulkanClient::UpdateViewportSize(HWND hWnd)
@@ -419,15 +552,35 @@ void VulkanClient::clbkCloseSession(bool fastclose)
 	stubParticleStreams.clear();
 }
 
+void VulkanClient::ReclaimRetiredSurfaces()
+{
+	if (retiredSurfaces.empty())
+		return;
+
+	constexpr uint64_t kRetireDelay = VkSwapchain::kMaxFramesInFlight + 1;
+	size_t dst = 0;
+	for (size_t i = 0; i < retiredSurfaces.size(); ++i) {
+		if (frameCounter >= retiredSurfaces[i].retireFrame + kRetireDelay)
+			delete retiredSurfaces[i].surf;
+		else
+			retiredSurfaces[dst++] = retiredSurfaces[i];
+	}
+	retiredSurfaces.resize(dst);
+}
+
 void VulkanClient::DestroyAllSurfaces()
 {
 	if (ctx && ctx->Device())
 		vkDeviceWaitIdle(ctx->Device());
 
 	sharedTextures.clear();
+	for (const RetiredSurface &entry : retiredSurfaces)
+		delete entry.surf;
+	retiredSurfaces.clear();
 	for (VkSurfNative *s : surfaceCatalog)
 		delete s;
 	surfaceCatalog.clear();
+	frameCounter = 0;
 }
 
 void VulkanClient::clbkDestroyRenderWindow(bool fastclose)
@@ -436,9 +589,14 @@ void VulkanClient::clbkDestroyRenderWindow(bool fastclose)
 	if (imguiInitialized)
 		clbkImGuiShutdown();
 	DestroyAllSurfaces();
+	blitter.reset();
 	GraphicsClient::clbkDestroyRenderWindow(fastclose);
 	swapchain.reset();
 	ctx.reset();
+	renderWnd = nullptr;
+	bltGroupTgt = RENDERTGT_NONE;
+	customSplashPath.clear();
+	customSplashCol = 0xA06060;
 }
 
 void VulkanClient::clbkBeginFrame()
@@ -446,9 +604,12 @@ void VulkanClient::clbkBeginFrame()
 	imguiFrameRendered = false;
 	if (!swapchain)
 		return;
-	if (swapchain->BeginFrame(GetRenderWindow())) {
+	HWND hWnd = GetRenderWindow() ? GetRenderWindow() : renderWnd;
+	if (swapchain->BeginFrame(hWnd)) {
 		viewW = swapchain->Extent().width;
 		viewH = swapchain->Extent().height;
+		++frameCounter;
+		ReclaimRetiredSurfaces();
 	}
 }
 
@@ -480,7 +641,8 @@ bool VulkanClient::clbkDisplayFrame()
 {
 	if (!swapchain)
 		return false;
-	return swapchain->Present(GetRenderWindow());
+	HWND hWnd = GetRenderWindow() ? GetRenderWindow() : renderWnd;
+	return swapchain->Present(hWnd);
 }
 
 void VulkanClient::clbkImGuiInit()
@@ -549,6 +711,8 @@ void VulkanClient::clbkImGuiShutdown()
 
 	for (VkSurfNative *s : surfaceCatalog)
 		s->ReleaseImGuiDescriptorSet();
+	for (const RetiredSurface &entry : retiredSurfaces)
+		entry.surf->ReleaseImGuiDescriptorSet();
 
 	DestroyImGuiPlaceholderTexture();
 	ImGui_ImplVulkan_Shutdown();
@@ -573,8 +737,18 @@ void VulkanClient::clbkImGuiRenderDrawData()
 	imguiFrameRendered = true;
 	if (swapchain && swapchain->IsFrameRecording()) {
 		ImDrawData *drawData = ImGui::GetDrawData();
-		if (drawData)
-			ImGui_ImplVulkan_RenderDrawData(drawData, swapchain->CurrentCommandBuffer());
+		if (drawData) {
+			if (drawData->Textures != nullptr) {
+				for (ImTextureData *tex : *drawData->Textures) {
+					if (tex->Status != ImTextureStatus_OK)
+						ImGui_ImplVulkan_UpdateTexture(tex);
+				}
+			}
+			if (swapchain->BeginSceneOverlayPass()) {
+				ImGui_ImplVulkan_RenderDrawData(drawData, swapchain->CurrentCommandBuffer());
+				swapchain->EndSceneOverlayPass();
+			}
+		}
 	}
 }
 
@@ -889,8 +1063,10 @@ bool VulkanClient::clbkReleaseSurface(SURFHANDLE surf)
 		return false;
 
 	if (s->DecRef()) {
+		if (bltGroupTgt == surf)
+			bltGroupTgt = RENDERTGT_NONE;
 		surfaceCatalog.erase(it);
-		delete s;
+		retiredSurfaces.push_back({ s, frameCounter });
 		return true;
 	}
 	return false;
@@ -1013,6 +1189,344 @@ bool VulkanClient::clbkSaveSurfaceToImage(SURFHANDLE surf, const char *fname, Im
 	id.data = bgr.data();
 
 	return WriteImageDataToFile(id, fname, fmt, quality);
+}
+
+// ==============================================================
+// Surface Blitting, Filling & Win32 GDI Bridge (Unit 1.2)
+// ==============================================================
+
+int VulkanClient::clbkBeginBltGroup(SURFHANDLE tgt)
+{
+	if (tgt == RENDERTGT_NONE)
+		return -2;
+	if (bltGroupTgt != RENDERTGT_NONE)
+		return -1;
+	if (tgt != RENDERTGT_MAINWINDOW) {
+		auto *s = reinterpret_cast<VkSurfNative *>(tgt);
+		if (surfaceCatalog.count(s) == 0)
+			return -3;
+	}
+	bltGroupTgt = tgt;
+	return 0;
+}
+
+int VulkanClient::clbkEndBltGroup()
+{
+	if (bltGroupTgt == RENDERTGT_NONE)
+		return -2;
+	bltGroupTgt = RENDERTGT_NONE;
+	return 0;
+}
+
+bool VulkanClient::clbkBlt(SURFHANDLE tgt, DWORD tgtx, DWORD tgty, SURFHANDLE src, DWORD flag) const
+{
+	if (!src || src == RENDERTGT_NONE)
+		return false;
+	const auto *srcSurf = reinterpret_cast<const VkSurfNative *>(src);
+	if (surfaceCatalog.count(const_cast<VkSurfNative *>(srcSurf)) == 0)
+		return false;
+	return clbkScaleBlt(tgt, tgtx, tgty, srcSurf->GetWidth(), srcSurf->GetHeight(),
+		src, 0, 0, srcSurf->GetWidth(), srcSurf->GetHeight(), flag);
+}
+
+bool VulkanClient::clbkBlt(SURFHANDLE tgt, DWORD tgtx, DWORD tgty, SURFHANDLE src, DWORD srcx, DWORD srcy, DWORD w, DWORD h, DWORD flag) const
+{
+	return clbkScaleBlt(tgt, tgtx, tgty, w, h, src, srcx, srcy, w, h, flag);
+}
+
+bool VulkanClient::clbkScaleBlt(
+	SURFHANDLE tgt, DWORD tgtx, DWORD tgty, DWORD tgtw, DWORD tgth,
+	SURFHANDLE src, DWORD srcx, DWORD srcy, DWORD srcw, DWORD srch, DWORD flag) const
+{
+	if (!ctx || !swapchain || !src || src == RENDERTGT_NONE || tgt == RENDERTGT_NONE)
+		return false;
+
+	auto *srcSurf = reinterpret_cast<VkSurfNative *>(src);
+	if (surfaceCatalog.count(srcSurf) == 0)
+		return false;
+
+	const bool tgtIsMain = (tgt == RENDERTGT_MAINWINDOW);
+	VkSurfNative *tgtSurf = nullptr;
+	if (!tgtIsMain) {
+		tgtSurf = reinterpret_cast<VkSurfNative *>(tgt);
+		if (surfaceCatalog.count(tgtSurf) == 0)
+			return false;
+		if (tgtSurf->IsCompressed() && !tgtSurf->Decompress())
+			return false;
+	}
+
+	const uint32_t srcTexW = srcSurf->GetWidth();
+	const uint32_t srcTexH = srcSurf->GetHeight();
+	const uint32_t dstTexW = tgtIsMain ? swapchain->SceneExtent().width : tgtSurf->GetWidth();
+	const uint32_t dstTexH = tgtIsMain ? swapchain->SceneExtent().height : tgtSurf->GetHeight();
+
+	if (srcw == 0 || srch == 0 || tgtw == 0 || tgth == 0 ||
+		srcTexW == 0 || srcTexH == 0 || dstTexW == 0 || dstTexH == 0)
+	{
+		return true;
+	}
+
+	const RECT rs = { (LONG)srcx, (LONG)srcy, (LONG)srcx + (LONG)srcw, (LONG)srcy + (LONG)srch };
+	const RECT rt = { (LONG)tgtx, (LONG)tgty, (LONG)tgtx + (LONG)tgtw, (LONG)tgty + (LONG)tgth };
+
+	// Match D3D7 / D3D9Client unclipped rectangle rejection semantics
+	if (rs.left < 0 || rs.top < 0 || rs.right > (LONG)srcTexW || rs.bottom > (LONG)srcTexH)
+		return true;
+	if (rt.left < 0 || rt.top < 0 || rt.right > (LONG)dstTexW || rt.bottom > (LONG)dstTexH)
+		return true;
+	if (rs.left >= rs.right || rs.top >= rs.bottom || rt.left >= rt.right || rt.top >= rt.bottom)
+		return true;
+
+	VkCommandBuffer cmd = swapchain->ActiveCommandBuffer();
+	if (cmd == VK_NULL_HANDLE)
+		return false;
+
+	const DWORD srcCK = srcSurf->GetColorKey();
+	const bool useColorKey = (srcCK != SURF_NO_CK) && (((flag & BLT_SRCCOLORKEY) != 0) || (srcCK != 0));
+	const bool isScaled = (srcw != tgtw) || (srch != tgth);
+
+	// Same-surface blit (e.g. HUD / ShuttleA ADI): route through per-surface temporary image
+	if (tgtSurf && srcSurf == tgtSurf) {
+		if (!srcSurf->EnsureTempBlitImage())
+			return false;
+
+		srcSurf->TransitionToTransferSrc(cmd);
+
+		VkImageMemoryBarrier2 tmpToDst{};
+		tmpToDst.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+		tmpToDst.srcStageMask        = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+		tmpToDst.srcAccessMask       = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+		tmpToDst.dstStageMask        = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+		tmpToDst.dstAccessMask       = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+		tmpToDst.oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
+		tmpToDst.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		tmpToDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		tmpToDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		tmpToDst.image               = srcSurf->GetTempBlitImage();
+		tmpToDst.subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+		VkDependencyInfo dep{};
+		dep.sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+		dep.imageMemoryBarrierCount = 1;
+		dep.pImageMemoryBarriers    = &tmpToDst;
+		vkCmdPipelineBarrier2(cmd, &dep);
+
+		VkImageCopy2 copyRegion{};
+		copyRegion.sType          = VK_STRUCTURE_TYPE_IMAGE_COPY_2;
+		copyRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		copyRegion.srcOffset      = { rs.left, rs.top, 0 };
+		copyRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		copyRegion.dstOffset      = { 0, 0, 0 };
+		copyRegion.extent         = { srcw, srch, 1 };
+
+		VkCopyImageInfo2 copyInfo{};
+		copyInfo.sType          = VK_STRUCTURE_TYPE_COPY_IMAGE_INFO_2;
+		copyInfo.srcImage       = srcSurf->GetImage();
+		copyInfo.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+		copyInfo.dstImage       = srcSurf->GetTempBlitImage();
+		copyInfo.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		copyInfo.regionCount    = 1;
+		copyInfo.pRegions       = &copyRegion;
+		vkCmdCopyImage2(cmd, &copyInfo);
+
+		bool ok = false;
+		if (!useColorKey) {
+			VkImageMemoryBarrier2 tmpToSrc = tmpToDst;
+			tmpToSrc.srcStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+			tmpToSrc.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+			tmpToSrc.dstStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+			tmpToSrc.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+			tmpToSrc.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			tmpToSrc.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+			dep.pImageMemoryBarriers = &tmpToSrc;
+			vkCmdPipelineBarrier2(cmd, &dep);
+
+			tgtSurf->TransitionToTransferDst(cmd);
+
+			VkImageBlit2 blitRegion{};
+			blitRegion.sType          = VK_STRUCTURE_TYPE_IMAGE_BLIT_2;
+			blitRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+			blitRegion.srcOffsets[0]  = { 0, 0, 0 };
+			blitRegion.srcOffsets[1]  = { (int32_t)srcw, (int32_t)srch, 1 };
+			blitRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+			blitRegion.dstOffsets[0]  = { rt.left, rt.top, 0 };
+			blitRegion.dstOffsets[1]  = { rt.right, rt.bottom, 1 };
+
+			VkBlitImageInfo2 blitInfo{};
+			blitInfo.sType          = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2;
+			blitInfo.srcImage       = srcSurf->GetTempBlitImage();
+			blitInfo.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+			blitInfo.dstImage       = tgtSurf->GetImage();
+			blitInfo.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			blitInfo.regionCount    = 1;
+			blitInfo.pRegions       = &blitRegion;
+			blitInfo.filter         = isScaled ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+			vkCmdBlitImage2(cmd, &blitInfo);
+			ok = true;
+		} else if (blitter) {
+			VkImageMemoryBarrier2 tmpToSample = tmpToDst;
+			tmpToSample.srcStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+			tmpToSample.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+			tmpToSample.dstStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+			tmpToSample.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+			tmpToSample.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			tmpToSample.newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			dep.pImageMemoryBarriers  = &tmpToSample;
+			vkCmdPipelineBarrier2(cmd, &dep);
+
+			tgtSurf->TransitionToColorAttachment(cmd);
+			const RECT tmpRs = { 0, 0, (LONG)srcw, (LONG)srch };
+			const uint32_t slot = swapchain->ActiveSlotIndex();
+			ok = blitter->Blit(
+				cmd, slot, swapchain->SlotGeneration(slot),
+				srcSurf->GetTempBlitView(), srcTexW, srcTexH,
+				tgtSurf->GetRenderTargetView(), tgtSurf->GetFormat(), dstTexW, dstTexH,
+				tmpRs, rt, true, srcCK, false);
+		}
+
+		if (tgtSurf->GetMipMaps() > 1)
+			tgtSurf->RegenerateMipmaps(cmd);
+		tgtSurf->MarkGpuDirty();
+		return ok;
+	}
+
+	const VkFormat dstFormat = tgtIsMain ? swapchain->SceneFormat() : tgtSurf->GetFormat();
+	const bool dstHasAlpha = tgtIsMain ? false : tgtSurf->HasAlpha();
+	const bool canFastBlit = !useColorKey &&
+		!srcSurf->IsCompressed() &&
+		(srcSurf->GetFormat() == dstFormat) &&
+		(srcSurf->HasAlpha() || !dstHasAlpha);
+
+	if (canFastBlit) {
+		srcSurf->TransitionToTransferSrc(cmd);
+		if (tgtIsMain) {
+			if (swapchain->SceneLayout() == VK_IMAGE_LAYOUT_UNDEFINED &&
+				(rt.left > 0 || rt.top > 0 || rt.right < (LONG)dstTexW || rt.bottom < (LONG)dstTexH))
+			{
+				swapchain->FillScene(nullptr, 0);
+			}
+			swapchain->TransitionSceneLayout(
+				cmd,
+				VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+				VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+				VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+				VK_ACCESS_2_TRANSFER_WRITE_BIT);
+		} else {
+			tgtSurf->TransitionToTransferDst(cmd);
+		}
+
+		VkImageBlit2 blitRegion{};
+		blitRegion.sType          = VK_STRUCTURE_TYPE_IMAGE_BLIT_2;
+		blitRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		blitRegion.srcOffsets[0]  = { rs.left, rs.top, 0 };
+		blitRegion.srcOffsets[1]  = { rs.right, rs.bottom, 1 };
+		blitRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+		blitRegion.dstOffsets[0]  = { rt.left, rt.top, 0 };
+		blitRegion.dstOffsets[1]  = { rt.right, rt.bottom, 1 };
+
+		VkBlitImageInfo2 blitInfo{};
+		blitInfo.sType          = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2;
+		blitInfo.srcImage       = srcSurf->GetImage();
+		blitInfo.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+		blitInfo.dstImage       = tgtIsMain ? swapchain->SceneImage() : tgtSurf->GetImage();
+		blitInfo.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		blitInfo.regionCount    = 1;
+		blitInfo.pRegions       = &blitRegion;
+		blitInfo.filter         = isScaled ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+		vkCmdBlitImage2(cmd, &blitInfo);
+
+		if (tgtSurf) {
+			if (tgtSurf->GetMipMaps() > 1)
+				tgtSurf->RegenerateMipmaps(cmd);
+			tgtSurf->MarkGpuDirty();
+		}
+		return true;
+	}
+
+	if (!blitter)
+		return false;
+
+	srcSurf->TransitionToShaderRead(cmd);
+
+	VkImageView dstView = VK_NULL_HANDLE;
+	if (tgtIsMain) {
+		if (swapchain->SceneLayout() == VK_IMAGE_LAYOUT_UNDEFINED)
+			swapchain->FillScene(nullptr, 0);
+		swapchain->TransitionSceneLayout(
+			cmd,
+			VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+			VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+			VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+			VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+		dstView = swapchain->SceneImageView();
+	} else {
+		tgtSurf->TransitionToColorAttachment(cmd);
+		dstView = tgtSurf->GetRenderTargetView();
+	}
+
+	const uint32_t slot = swapchain->ActiveSlotIndex();
+	const bool linearFilter = isScaled && !useColorKey;
+	const bool ok = blitter->Blit(
+		cmd, slot, swapchain->SlotGeneration(slot),
+		srcSurf->GetImageView(), srcTexW, srcTexH,
+		dstView, dstFormat, dstTexW, dstTexH,
+		rs, rt, useColorKey, srcCK, linearFilter);
+
+	if (tgtSurf) {
+		if (tgtSurf->GetMipMaps() > 1)
+			tgtSurf->RegenerateMipmaps(cmd);
+		tgtSurf->MarkGpuDirty();
+	}
+	return ok;
+}
+
+bool VulkanClient::clbkFillSurface(SURFHANDLE surf, DWORD col) const
+{
+	if (!swapchain || surf == RENDERTGT_NONE)
+		return false;
+	if (surf == RENDERTGT_MAINWINDOW)
+		return swapchain->FillScene(nullptr, col);
+
+	auto *s = reinterpret_cast<VkSurfNative *>(surf);
+	if (surfaceCatalog.count(s) == 0)
+		return false;
+	return s->Fill(nullptr, col);
+}
+
+bool VulkanClient::clbkFillSurface(SURFHANDLE surf, DWORD tgtx, DWORD tgty, DWORD w, DWORD h, DWORD col) const
+{
+	if (!swapchain || surf == RENDERTGT_NONE)
+		return false;
+	const RECT rc = { (LONG)tgtx, (LONG)tgty, (LONG)tgtx + (LONG)w, (LONG)tgty + (LONG)h };
+	if (surf == RENDERTGT_MAINWINDOW)
+		return swapchain->FillScene(&rc, col);
+
+	auto *s = reinterpret_cast<VkSurfNative *>(surf);
+	if (surfaceCatalog.count(s) == 0)
+		return false;
+	return s->Fill(&rc, col);
+}
+
+HDC VulkanClient::clbkGetSurfaceDC(SURFHANDLE surf)
+{
+	if (!surf || surf == RENDERTGT_NONE)
+		return nullptr;
+	auto *s = reinterpret_cast<VkSurfNative *>(surf);
+	if (surfaceCatalog.count(s) == 0)
+		return nullptr;
+	return s->GetDC();
+}
+
+void VulkanClient::clbkReleaseSurfaceDC(SURFHANDLE surf, HDC hDC)
+{
+	if (!surf || surf == RENDERTGT_NONE || !hDC)
+		return;
+	auto *s = reinterpret_cast<VkSurfNative *>(surf);
+	if (surfaceCatalog.count(s) == 0)
+		return;
+	s->ReleaseDC(hDC);
 }
 
 // ==============================================================

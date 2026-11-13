@@ -8,6 +8,7 @@
 #include "VkSwapchain.h"
 #include "VkContext.h"
 #include "VkLog.h"
+#include <algorithm>
 #include <cstring>
 
 namespace {
@@ -340,6 +341,13 @@ void VkSwapchain::DestroyFrameResources()
 		vkDestroyFence(ctx->Device(), offscreenFence, nullptr);
 		offscreenFence = VK_NULL_HANDLE;
 	}
+	if (ctx->Allocator() != VK_NULL_HANDLE) {
+		for (const DeferredBuffer &db : offscreenDeferredStaging) {
+			if (db.buf != VK_NULL_HANDLE)
+				vmaDestroyBuffer(ctx->Allocator(), db.buf, db.alloc);
+		}
+	}
+	offscreenDeferredStaging.clear();
 	if (offscreenPool != VK_NULL_HANDLE) {
 		vkDestroyCommandPool(ctx->Device(), offscreenPool, nullptr);
 		offscreenPool = VK_NULL_HANDLE;
@@ -349,6 +357,13 @@ void VkSwapchain::DestroyFrameResources()
 	offscreenHasWork = false;
 
 	for (uint32_t i = 0; i < kMaxFramesInFlight; ++i) {
+		if (ctx->Allocator() != VK_NULL_HANDLE) {
+			for (const DeferredBuffer &db : frames[i].deferredStaging) {
+				if (db.buf != VK_NULL_HANDLE)
+					vmaDestroyBuffer(ctx->Allocator(), db.buf, db.alloc);
+			}
+		}
+		frames[i].deferredStaging.clear();
 		if (frames[i].inFlight != VK_NULL_HANDLE) {
 			vkDestroyFence(ctx->Device(), frames[i].inFlight, nullptr);
 			frames[i].inFlight = VK_NULL_HANDLE;
@@ -373,8 +388,25 @@ void VkSwapchain::TransitionSceneLayout(
 	VkPipelineStageFlags2 dstStage,
 	VkAccessFlags2 dstAccess)
 {
-	if (sceneLayout == newLayout)
+	if (sceneLayout == newLayout) {
+		if (newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ||
+			newLayout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
+		{
+			VkMemoryBarrier2 mb{};
+			mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+			mb.srcStageMask  = srcStage;
+			mb.srcAccessMask = srcAccess;
+			mb.dstStageMask  = dstStage;
+			mb.dstAccessMask = dstAccess;
+
+			VkDependencyInfo dep{};
+			dep.sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+			dep.memoryBarrierCount = 1;
+			dep.pMemoryBarriers    = &mb;
+			vkCmdPipelineBarrier2(cmd, &dep);
+		}
 		return;
+	}
 
 	RecordImageBarrier(cmd, sceneImage, sceneLayout, newLayout,
 		srcStage, srcAccess, dstStage, dstAccess);
@@ -388,6 +420,7 @@ VkCommandBuffer VkSwapchain::OffscreenCommandBuffer()
 
 	if (!offscreenRecording) {
 		vkResetCommandPool(ctx->Device(), offscreenPool, 0);
+		++offscreenGeneration;
 
 		VkCommandBufferBeginInfo cbbi{};
 		cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -402,6 +435,16 @@ VkCommandBuffer VkSwapchain::OffscreenCommandBuffer()
 	return cmdOffscreen;
 }
 
+void VkSwapchain::DeferStagingFree(VkBuffer buf, VmaAllocation alloc)
+{
+	if (buf == VK_NULL_HANDLE)
+		return;
+	if (frameRecording)
+		frames[currentFrame].deferredStaging.push_back({ buf, alloc });
+	else
+		offscreenDeferredStaging.push_back({ buf, alloc });
+}
+
 bool VkSwapchain::FlushOffscreenCommands()
 {
 	if (!ctx || !offscreenRecording)
@@ -410,6 +453,9 @@ bool VkSwapchain::FlushOffscreenCommands()
 	offscreenRecording = false;
 	if (!offscreenHasWork) {
 		vkEndCommandBuffer(cmdOffscreen);
+		for (const DeferredBuffer &db : offscreenDeferredStaging)
+			vmaDestroyBuffer(ctx->Allocator(), db.buf, db.alloc);
+		offscreenDeferredStaging.clear();
 		return true;
 	}
 	offscreenHasWork = false;
@@ -433,7 +479,13 @@ bool VkSwapchain::FlushOffscreenCommands()
 		return false;
 	}
 
-	return vkWaitForFences(ctx->Device(), 1, &offscreenFence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+	const bool ok = vkWaitForFences(ctx->Device(), 1, &offscreenFence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+	if (ok) {
+		for (const DeferredBuffer &db : offscreenDeferredStaging)
+			vmaDestroyBuffer(ctx->Allocator(), db.buf, db.alloc);
+		offscreenDeferredStaging.clear();
+	}
+	return ok;
 }
 
 bool VkSwapchain::ReadbackSceneTarget(std::vector<uint8_t> &outBgra, uint32_t &outWidth, uint32_t &outHeight)
@@ -543,6 +595,10 @@ bool VkSwapchain::BeginFrame(HWND hWnd)
 	if (vkWaitForFences(ctx->Device(), 1, &f.inFlight, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
 		return false;
 
+	for (const DeferredBuffer &db : f.deferredStaging)
+		vmaDestroyBuffer(ctx->Allocator(), db.buf, db.alloc);
+	f.deferredStaging.clear();
+
 	VkResult acqRes = vkAcquireNextImageKHR(
 		ctx->Device(), swapchain.swapchain, UINT64_MAX,
 		f.imageAvailable, VK_NULL_HANDLE, &currentImageIndex);
@@ -561,6 +617,7 @@ bool VkSwapchain::BeginFrame(HWND hWnd)
 
 	vkResetFences(ctx->Device(), 1, &f.inFlight);
 	vkResetCommandPool(ctx->Device(), f.cmdPool, 0);
+	++f.generation;
 
 	VkCommandBufferBeginInfo cbbi{};
 	cbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -575,8 +632,8 @@ bool VkSwapchain::BeginFrame(HWND hWnd)
 	TransitionSceneLayout(
 		f.cmd,
 		VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		firstTouch ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-		firstTouch ? 0 : VK_ACCESS_2_TRANSFER_READ_BIT,
+		firstTouch ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+		firstTouch ? 0 : (VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT),
 		VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
 		VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT);
 
@@ -636,6 +693,148 @@ void VkSwapchain::ClearScene(const VkClearColorValue &clearColor)
 	vkCmdEndRendering(cmd);
 }
 
+bool VkSwapchain::FillScene(const RECT *rect, DWORD col)
+{
+	if (!ctx || sceneImage == VK_NULL_HANDLE || sceneView == VK_NULL_HANDLE ||
+		sceneExtent.width == 0 || sceneExtent.height == 0)
+	{
+		return false;
+	}
+
+	VkCommandBuffer cmd = ActiveCommandBuffer();
+	if (cmd == VK_NULL_HANDLE)
+		return false;
+
+	VkClearColorValue clearVal{};
+	clearVal.float32[0] = (float)((col >> 16) & 0xFFu) / 255.0f;
+	clearVal.float32[1] = (float)((col >> 8) & 0xFFu) / 255.0f;
+	clearVal.float32[2] = (float)(col & 0xFFu) / 255.0f;
+	clearVal.float32[3] = 1.0f;
+
+	const bool fullClear = (!rect) ||
+		(rect->left <= 0 && rect->top <= 0 &&
+		 rect->right >= (LONG)sceneExtent.width &&
+		 rect->bottom >= (LONG)sceneExtent.height);
+
+	if (fullClear) {
+		TransitionSceneLayout(
+			cmd,
+			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+			VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+			VK_PIPELINE_STAGE_2_CLEAR_BIT,
+			VK_ACCESS_2_TRANSFER_WRITE_BIT);
+
+		VkImageSubresourceRange range{};
+		range.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+		range.baseMipLevel   = 0;
+		range.levelCount     = 1;
+		range.baseArrayLayer = 0;
+		range.layerCount     = 1;
+		vkCmdClearColorImage(cmd, sceneImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearVal, 1, &range);
+		return true;
+	}
+
+	const int32_t x0 = std::max<int32_t>(0, rect->left);
+	const int32_t y0 = std::max<int32_t>(0, rect->top);
+	const int32_t x1 = std::min<int32_t>((int32_t)sceneExtent.width, rect->right);
+	const int32_t y1 = std::min<int32_t>((int32_t)sceneExtent.height, rect->bottom);
+	if (x1 <= x0 || y1 <= y0)
+		return true;
+
+	if (sceneLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+		TransitionSceneLayout(
+			cmd,
+			VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+			0,
+			VK_PIPELINE_STAGE_2_CLEAR_BIT,
+			VK_ACCESS_2_TRANSFER_WRITE_BIT);
+		const VkClearColorValue initBlack = { { 0.0f, 0.0f, 0.0f, 1.0f } };
+		VkImageSubresourceRange range{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+		vkCmdClearColorImage(cmd, sceneImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &initBlack, 1, &range);
+	}
+
+	TransitionSceneLayout(
+		cmd,
+		VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+		VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+		VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+		VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+	VkRenderingAttachmentInfo colorAtt{};
+	colorAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+	colorAtt.imageView   = sceneView;
+	colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	colorAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
+	colorAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+
+	VkRenderingInfo ri{};
+	ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
+	ri.renderArea.offset    = { 0, 0 };
+	ri.renderArea.extent    = sceneExtent;
+	ri.layerCount           = 1;
+	ri.colorAttachmentCount = 1;
+	ri.pColorAttachments    = &colorAtt;
+
+	vkCmdBeginRendering(cmd, &ri);
+
+	VkClearAttachment ca{};
+	ca.aspectMask      = VK_IMAGE_ASPECT_COLOR_BIT;
+	ca.colorAttachment = 0;
+	ca.clearValue.color = clearVal;
+
+	VkClearRect cr{};
+	cr.rect.offset      = { x0, y0 };
+	cr.rect.extent      = { (uint32_t)(x1 - x0), (uint32_t)(y1 - y0) };
+	cr.baseArrayLayer   = 0;
+	cr.layerCount       = 1;
+	vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
+
+	vkCmdEndRendering(cmd);
+	return true;
+}
+
+bool VkSwapchain::BeginSceneOverlayPass()
+{
+	if (!frameRecording || sceneView == VK_NULL_HANDLE)
+		return false;
+
+	VkCommandBuffer cmd = frames[currentFrame].cmd;
+	TransitionSceneLayout(
+		cmd,
+		VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+		VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+		VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+		VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+	VkRenderingAttachmentInfo colorAtt{};
+	colorAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+	colorAtt.imageView   = sceneView;
+	colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	colorAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
+	colorAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+
+	VkRenderingInfo ri{};
+	ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
+	ri.renderArea.offset    = { 0, 0 };
+	ri.renderArea.extent    = sceneExtent;
+	ri.layerCount           = 1;
+	ri.colorAttachmentCount = 1;
+	ri.pColorAttachments    = &colorAtt;
+
+	vkCmdBeginRendering(cmd, &ri);
+	return true;
+}
+
+void VkSwapchain::EndSceneOverlayPass()
+{
+	if (frameRecording)
+		vkCmdEndRendering(frames[currentFrame].cmd);
+}
+
 void VkSwapchain::EndFrame()
 {
 	if (!frameRecording)
@@ -646,8 +845,8 @@ void VkSwapchain::EndFrame()
 	TransitionSceneLayout(
 		cmd,
 		VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-		VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-		VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+		VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+		VK_ACCESS_2_MEMORY_WRITE_BIT,
 		VK_PIPELINE_STAGE_2_TRANSFER_BIT,
 		VK_ACCESS_2_TRANSFER_READ_BIT);
 

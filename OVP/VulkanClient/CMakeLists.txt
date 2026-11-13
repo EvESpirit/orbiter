@@ -49,6 +49,7 @@ set(VKCLIENT_SOURCES
   VkConfig.cpp
   VkContext.cpp
   VkSwapchain.cpp
+  VkBlit.cpp
   VkSurface.cpp
   VideoTab.cpp
   VulkanClient.cpp
@@ -63,9 +64,17 @@ set(VKCLIENT_HEADERS
   VkConfig.h
   VkContext.h
   VkSwapchain.h
+  VkBlit.h
   VkSurface.h
   VideoTab.h
   VulkanClient.h
+)
+
+set(VKCLIENT_SHADERS
+  Shaders/Blit.vert
+  Shaders/Blit.frag
+  Shaders/BlitVertSpv.h
+  Shaders/BlitFragSpv.h
 )
 
 set(VKCLIENT_API_HEADERS
@@ -76,11 +85,13 @@ set_source_files_properties(${VKCLIENT_API_HEADERS} PROPERTIES GENERATED TRUE)
 
 source_group("Include Files" FILES ${VKCLIENT_HEADERS})
 source_group("Source Files" FILES ${VKCLIENT_SOURCES})
+source_group("Shader Files" FILES ${VKCLIENT_SHADERS})
 source_group("API Headers" FILES ${VKCLIENT_API_HEADERS})
 
 add_library(VulkanClient MODULE
   ${VKCLIENT_SOURCES}
   ${VKCLIENT_HEADERS}
+  ${VKCLIENT_SHADERS}
   ${VKCLIENT_API_HEADERS}
   VulkanClient.rc
 )

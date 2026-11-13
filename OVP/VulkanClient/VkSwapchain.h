@@ -34,6 +34,9 @@ public:
 
 	bool BeginFrame(HWND hWnd);
 	void ClearScene(const VkClearColorValue &clearColor);
+	bool FillScene(const RECT *rect, DWORD col);
+	bool BeginSceneOverlayPass();
+	void EndSceneOverlayPass();
 	void EndFrame();
 	bool Present(HWND hWnd);
 
@@ -56,6 +59,9 @@ public:
 
 	VkCommandBuffer OffscreenCommandBuffer();
 	VkCommandBuffer ActiveCommandBuffer() { return frameRecording ? frames[currentFrame].cmd : OffscreenCommandBuffer(); }
+	uint32_t ActiveSlotIndex() const { return frameRecording ? currentFrame : kMaxFramesInFlight; }
+	uint64_t SlotGeneration(uint32_t slot) const { return (slot < kMaxFramesInFlight) ? frames[slot].generation : offscreenGeneration; }
+	void DeferStagingFree(VkBuffer buf, VmaAllocation alloc);
 	bool FlushOffscreenCommands();
 
 	bool ReadbackSceneTarget(std::vector<uint8_t> &outBgra, uint32_t &outWidth, uint32_t &outHeight);
@@ -69,11 +75,18 @@ public:
 		VkAccessFlags2 dstAccess);
 
 private:
+	struct DeferredBuffer {
+		VkBuffer buf = VK_NULL_HANDLE;
+		VmaAllocation alloc = VK_NULL_HANDLE;
+	};
+
 	struct FrameSync {
 		VkCommandPool cmdPool = VK_NULL_HANDLE;
 		VkCommandBuffer cmd = VK_NULL_HANDLE;
 		VkSemaphore imageAvailable = VK_NULL_HANDLE;
 		VkFence inFlight = VK_NULL_HANDLE;
+		uint64_t generation = 1;
+		std::vector<DeferredBuffer> deferredStaging;
 	};
 
 	bool CreateSwapchainInternal(uint32_t width, uint32_t height);
@@ -110,6 +123,8 @@ private:
 	VkCommandPool offscreenPool = VK_NULL_HANDLE;
 	VkCommandBuffer cmdOffscreen = VK_NULL_HANDLE;
 	VkFence offscreenFence = VK_NULL_HANDLE;
+	uint64_t offscreenGeneration = 1;
+	std::vector<DeferredBuffer> offscreenDeferredStaging;
 	bool offscreenRecording = false;
 	bool offscreenHasWork = false;
 };

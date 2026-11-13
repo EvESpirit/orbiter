@@ -20,6 +20,7 @@
 class VideoTab;
 class VkContext;
 class VkSwapchain;
+class VkBlitPipeline;
 class VkSurfNative;
 
 namespace oapi {
@@ -65,6 +66,17 @@ public:
 	bool clbkCopyBitmap(SURFHANDLE pdds, HBITMAP hbm, int x, int y, int dx, int dy) override;
 	bool clbkSaveSurfaceToImage(SURFHANDLE surf, const char *fname, ImageFileFormat fmt, float quality = 0.7f) override;
 
+	// Surface blitting, filling & Win32 GDI bridge (Unit 1.2)
+	bool clbkBlt(SURFHANDLE tgt, DWORD tgtx, DWORD tgty, SURFHANDLE src, DWORD flag = 0) const override;
+	bool clbkBlt(SURFHANDLE tgt, DWORD tgtx, DWORD tgty, SURFHANDLE src, DWORD srcx, DWORD srcy, DWORD w, DWORD h, DWORD flag = 0) const override;
+	bool clbkScaleBlt(SURFHANDLE tgt, DWORD tgtx, DWORD tgty, DWORD tgtw, DWORD tgth, SURFHANDLE src, DWORD srcx, DWORD srcy, DWORD srcw, DWORD srch, DWORD flag = 0) const override;
+	int clbkBeginBltGroup(SURFHANDLE tgt) override;
+	int clbkEndBltGroup() override;
+	bool clbkFillSurface(SURFHANDLE surf, DWORD col) const override;
+	bool clbkFillSurface(SURFHANDLE surf, DWORD tgtx, DWORD tgty, DWORD w, DWORD h, DWORD col) const override;
+	HDC clbkGetSurfaceDC(SURFHANDLE surf) override;
+	void clbkReleaseSurfaceDC(SURFHANDLE surf, HDC hDC) override;
+
 	// STUB (Unit 1.3): Font, pen, brush, and Sketchpad placeholders
 	Sketchpad *clbkGetSketchpad(SURFHANDLE surf) override;
 	void clbkReleaseSketchpad(Sketchpad *sp) override;
@@ -91,6 +103,7 @@ protected:
 	void clbkPostCreation() override;
 	void clbkCloseSession(bool fastclose) override;
 	void clbkDestroyRenderWindow(bool fastclose) override;
+	void clbkSetSplashScreen(const char *fname, DWORD textCol) override;
 
 	void clbkBeginFrame() override;
 	void clbkRenderScene() override;
@@ -98,17 +111,31 @@ protected:
 	bool clbkDisplayFrame() override;
 
 private:
+	struct RetiredSurface {
+		VkSurfNative *surf = nullptr;
+		uint64_t retireFrame = 0;
+	};
+
 	void UpdateViewportSize(HWND hWnd);
+	void RenderSplashScreen(HWND hWnd);
 	bool CreateImGuiPlaceholderTexture();
 	void DestroyImGuiPlaceholderTexture();
+	void ReclaimRetiredSurfaces();
 	void DestroyAllSurfaces();
 
 	std::unique_ptr<VideoTab> vtab;
 	std::unique_ptr<VkContext> ctx;                                  ///< Per-session Vulkan device (null outside a session)
 	std::unique_ptr<VkSwapchain> swapchain;                          ///< Per-session swapchain and scene target
+	std::unique_ptr<VkBlitPipeline> blitter;                         ///< Per-session 2D textured/color-keyed blit pipeline
 	std::unordered_set<VkSurfNative *> surfaceCatalog;               ///< All live VkSurfNative instances in the session
+	std::vector<RetiredSurface> retiredSurfaces;                     ///< Deferred destruction queue keeping GPU-referenced surfaces alive across in-flight frames
 	std::unordered_map<std::string, VkSurfNative *> sharedTextures;  ///< Shared/managed texture cache keyed by relative path
 	std::vector<std::unique_ptr<ParticleStream>> stubParticleStreams; // STUB (Phase 4): Vessel exhaust stream placeholders
+	uint64_t frameCounter = 0;                                       ///< Monotonic count of acquired swapchain frames in this session
+	HWND renderWnd = nullptr;                                        ///< Active Win32 render window handle
+	SURFHANDLE bltGroupTgt = RENDERTGT_NONE;                         ///< Current target set by clbkBeginBltGroup
+	std::string customSplashPath;                                    ///< Optional scenario splash image path
+	DWORD customSplashCol = 0xA06060;                                ///< Optional scenario splash text color (COLORREF)
 	DWORD viewW = 1280;                                              ///< Active render viewport width [px]
 	DWORD viewH = 720;                                               ///< Active render viewport height [px]
 	bool bFullscreen = false;                                        ///< Always false: full screen is a borderless window, never exclusive

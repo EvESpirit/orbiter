@@ -1789,6 +1789,7 @@ protected:
 	mutable DWORD m_convexHullClearBuiltMask = 0xFFFFFFFFu; // activeDockMask last baked into idle/suppressed clear indices
 	mutable bool m_convexHullClearBuilt = false; // true if m_convexHullClearIdx is up-to-date
 	mutable std::vector<VECTOR3> m_clearZoneCache; // cache for clear zone bounding boxes (min/max pairs)
+	mutable std::vector<VECTOR3> m_clearZoneStateCache; // filtered clear zone bounding boxes (min/max pairs)
 	mutable DWORD m_activeDockApproachMask; // bitmask of ports currently in dockingApproach
 	mutable double m_activeDockApproachTime; // SimT1 when m_activeDockApproachMask was last set
 	std::vector<VECTOR3> m_hullCacheP;  // hull points in planet-local frame
@@ -1816,6 +1817,7 @@ protected:
 	void UpdateHullCacheP();            // update m_hullCacheP from m_hullCache
 	DWORD GetEffectiveDockApproachMask() const;
 	void RebuildFilteredHullIndices(std::vector<WORD>& out, bool includeSolid, bool includeIdleClear, bool includeSuppressedClear, DWORD activeMask) const;
+	void CollectClearZoneAABBs(std::vector<VECTOR3>& out, bool filterByState, bool suppressed, DWORD activeMask) const;
 	static void ComputeDockApproachMasks(const Vessel *a, const Vessel *b, DWORD &maskA, DWORD &maskB);
 	void CheckBaseCollisions(class Planet *pp);
 	void ResolveCollisionWith(Vessel *v);

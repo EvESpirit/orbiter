@@ -909,9 +909,9 @@ void vVessel::RenderColliders()
 		}
 	}
 
-	// Draw clear zones
+	// Draw clear zones only when their real collision is actively suppressed
 	DWORD nBoxes = 0;
-	const VECTOR3* clearZones = vessel->GetCollisionClearZones(nBoxes);
+	const VECTOR3* clearZones = vessel->GetCollisionClearZonesByState(true, nBoxes);
 	if (clearZones && nBoxes > 0) {
 		D3DXMATRIX id;
 		D3DXMatrixIdentity(&id);
@@ -969,11 +969,14 @@ void vVessel::RenderDockingDebug()
 	vessel->GetDockingCollisionDebug(activeDockMask, nTotalSlices, nClearSlices, hitSliceA, hitMeshA, hitGroupA, hHitOther);
 
 	// 1. Render the actual convex sub-hull wireframes of the Clear-Zone slices per-port:
-	//    Bright Gold/Yellow for slices actively suppressed by dockingApproach, Cyan for idle clear zones
+	//    Bright Gold/Yellow when actively suppressed; Cyan when idle only if Vessel Colliders
+	//    aren't already drawing active slices in Green (avoid overwriting active Green colliders)
 	DWORD nPts = 0;
 	const VECTOR3 *pts = vessel->GetCollisionPointCloud(nPts);
 	DWORD nIdleIdx = 0;
-	const WORD *idleIdx = vessel->GetCollisionClearZoneHullIndicesByState(false, nIdleIdx);
+	const WORD *idleIdx = (!Config->bShowVesselColliders)
+		? vessel->GetCollisionClearZoneHullIndicesByState(false, nIdleIdx)
+		: NULL;
 	DWORD nSuppIdx = 0;
 	const WORD *suppIdx = vessel->GetCollisionClearZoneHullIndicesByState(true, nSuppIdx);
 
@@ -993,25 +996,27 @@ void vVessel::RenderDockingDebug()
 			}
 			D3D9Effect::RenderLines(dbgVtx.data(), dbgIdx.data(), dbgVtx.size(), dbgIdx.size(), &mWorld, color);
 		};
-		drawHullEdges(idleIdx, nIdleIdx, D3DCOLOR_RGBA(0, 220, 255, 160));   // Cyan: Clear zone idle (collision active)
+		drawHullEdges(idleIdx, nIdleIdx, D3DCOLOR_RGBA(0, 220, 255, 160));   // Cyan: Clear zone idle (when green colliders off)
 		drawHullEdges(suppIdx, nSuppIdx, D3DCOLOR_RGBA(255, 220, 0, 220));   // Gold/Yellow: Clear zone actively suppressed!
 	}
 
-	// 2. Render Clear-Zone AABB boxes
-	DWORD nBoxes = 0;
-	const VECTOR3* clearZones = vessel->GetCollisionClearZones(nBoxes);
-	if (clearZones && nBoxes > 0) {
-		D3DXMATRIX id;
-		D3DXMatrixIdentity(&id);
-		D3DXVECTOR4 boxCol = (activeDockMask != 0)
-			? D3DXVECTOR4(1.0f, 0.85f, 0.0f, 0.85f)
-			: D3DXVECTOR4(0.0f, 0.9f, 1.0f, 0.65f);
-		for (DWORD i = 0; i < nBoxes; i++) {
-			D3DXVECTOR4 bmin((float)clearZones[i*2].x, (float)clearZones[i*2].y, (float)clearZones[i*2].z, 1.0f);
-			D3DXVECTOR4 bmax((float)clearZones[i*2+1].x, (float)clearZones[i*2+1].y, (float)clearZones[i*2+1].z, 1.0f);
-			D3D9Effect::RenderBoundingBox(&mWorld, &id, &bmin, &bmax, &boxCol);
+	// 2. Render Clear-Zone AABB boxes (suppressed in Gold; idle in Cyan only if green colliders off)
+	auto drawClearBoxes = [&](bool suppressed, const D3DXVECTOR4& col) {
+		DWORD nBoxes = 0;
+		const VECTOR3* clearZones = vessel->GetCollisionClearZonesByState(suppressed, nBoxes);
+		if (clearZones && nBoxes > 0) {
+			D3DXMATRIX id;
+			D3DXMatrixIdentity(&id);
+			for (DWORD i = 0; i < nBoxes; i++) {
+				D3DXVECTOR4 bmin((float)clearZones[i*2].x, (float)clearZones[i*2].y, (float)clearZones[i*2].z, 1.0f);
+				D3DXVECTOR4 bmax((float)clearZones[i*2+1].x, (float)clearZones[i*2+1].y, (float)clearZones[i*2+1].z, 1.0f);
+				D3D9Effect::RenderBoundingBox(&mWorld, &id, &bmin, &bmax, &col);
+			}
 		}
-	}
+	};
+	if (!Config->bShowVesselColliders)
+		drawClearBoxes(false, D3DXVECTOR4(0.0f, 0.9f, 1.0f, 0.65f));
+	drawClearBoxes(true, D3DXVECTOR4(1.0f, 0.85f, 0.0f, 0.85f));
 
 	// 3. For each docking port, render the 3D Clear-Zone Cylinder, 0.3m Capture Ring, and Dir/Rot Arrows
 	double cylRadius = 2.2, cylZMin = -1.5, cylZMax = 2.5;

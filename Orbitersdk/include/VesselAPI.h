@@ -2212,6 +2212,15 @@ public:
 	 * \return Pointer to array of WORD indices into the point cloud, or NULL if none
 	 */
 	const WORD *GetCollisionClearZoneHullIndicesByState (bool suppressed, DWORD &nIdx) const;
+
+	/**
+	 * \brief Returns AABB (min/max pairs) for docking clear-zone slices filtered by suppression state.
+	 * \param suppressed If true, returns AABBs only for slices currently suppressed by an active docking approach;
+	 *                   if false, returns AABBs for idle clear-zone slices whose collision is currently active.
+	 * \param nBoxes [out] Number of bounding boxes
+	 * \return Pointer to an array of VECTOR3 pairs (min, max, min, max, ...), or NULL if none
+	 */
+	const VECTOR3 *GetCollisionClearZonesByState (bool suppressed, DWORD &nBoxes) const;
 	//@}
 
 

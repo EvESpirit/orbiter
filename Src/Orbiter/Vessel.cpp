@@ -10441,19 +10441,20 @@ const WORD *VESSEL::GetCollisionHullIndices (DWORD &nIdx) const
 	return &(vessel->m_convexHullIdx[0]);
 }
 
-const VECTOR3 *VESSEL::GetCollisionClearZones (DWORD &nBoxes) const
+void Vessel::CollectClearZoneAABBs(std::vector<VECTOR3>& out, bool filterByState, bool suppressed, DWORD activeMask) const
 {
-	vessel->RebuildHullCache();
-	vessel->ApplyAnimationToHullCache();
-
-	vessel->m_clearZoneCache.clear();
-	for (const auto& slice : vessel->m_hullGroupSlices) {
-		if (!slice.isDockClearZone || slice.count == 0 || slice.startIdx + slice.count > vessel->m_hullCache.size())
+	out.clear();
+	for (const auto& slice : m_hullGroupSlices) {
+		if (!slice.isDockClearZone || slice.count == 0 || slice.startIdx + slice.count > m_hullCache.size())
 			continue;
-		VECTOR3 bmin = vessel->m_hullCache[slice.startIdx];
+		if (filterByState) {
+			bool isSuppressed = ((slice.dockClearMask & activeMask) != 0);
+			if (isSuppressed != suppressed) continue;
+		}
+		VECTOR3 bmin = m_hullCache[slice.startIdx];
 		VECTOR3 bmax = bmin;
 		for (size_t i = 1; i < slice.count; i++) {
-			const VECTOR3& p = vessel->m_hullCache[slice.startIdx + i];
+			const VECTOR3& p = m_hullCache[slice.startIdx + i];
 			if (p.x < bmin.x) bmin.x = p.x;
 			if (p.y < bmin.y) bmin.y = p.y;
 			if (p.z < bmin.z) bmin.z = p.z;
@@ -10461,9 +10462,16 @@ const VECTOR3 *VESSEL::GetCollisionClearZones (DWORD &nBoxes) const
 			if (p.y > bmax.y) bmax.y = p.y;
 			if (p.z > bmax.z) bmax.z = p.z;
 		}
-		vessel->m_clearZoneCache.push_back(bmin);
-		vessel->m_clearZoneCache.push_back(bmax);
+		out.push_back(bmin);
+		out.push_back(bmax);
 	}
+}
+
+const VECTOR3 *VESSEL::GetCollisionClearZones (DWORD &nBoxes) const
+{
+	vessel->RebuildHullCache();
+	vessel->ApplyAnimationToHullCache();
+	vessel->CollectClearZoneAABBs(vessel->m_clearZoneCache, false, false, 0);
 
 	if (vessel->m_clearZoneCache.empty()) {
 		nBoxes = 0;
@@ -10472,6 +10480,21 @@ const VECTOR3 *VESSEL::GetCollisionClearZones (DWORD &nBoxes) const
 
 	nBoxes = (DWORD)(vessel->m_clearZoneCache.size() / 2);
 	return &(vessel->m_clearZoneCache[0]);
+}
+
+const VECTOR3 *VESSEL::GetCollisionClearZonesByState (bool suppressed, DWORD &nBoxes) const
+{
+	vessel->RebuildHullCache();
+	vessel->ApplyAnimationToHullCache();
+	vessel->CollectClearZoneAABBs(vessel->m_clearZoneStateCache, true, suppressed, vessel->GetEffectiveDockApproachMask());
+
+	if (vessel->m_clearZoneStateCache.empty()) {
+		nBoxes = 0;
+		return NULL;
+	}
+
+	nBoxes = (DWORD)(vessel->m_clearZoneStateCache.size() / 2);
+	return &(vessel->m_clearZoneStateCache[0]);
 }
 
 bool VESSEL::IsConvexCollider () const

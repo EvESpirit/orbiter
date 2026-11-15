@@ -4831,10 +4831,104 @@ bool Vessel::AnimationCompAffectsCollider(const ANIMATIONCOMP *comp) const {
 	return false;
 }
 
+struct DockClearFrame {
+	DWORD dockIdx;
+	Vector ref;
+	Vector dir; // axial unit vector
+	Vector u;   // radial axis 1
+	Vector v;   // radial axis 2
+};
+
+struct DockCellInfo {
+	size_t frameIdx;
+	bool inClearZ;
+	bool inCollarZ;
+	int sector;
+};
+
+static constexpr double kDockCollarRadius = 6.0;
+static constexpr double kDockCollarAxialPadBack = 1.0;
+static constexpr double kDockCollarAxialPadFwd = 1.5;
+
+// Splits a convex 3D polygon across dot(p, n) = d into negative and positive pieces,
+// keeping seam vertices on both sides so adjacent collider slices meet seamlessly.
+static std::vector<std::vector<Vector>> SplitConvexPolyByPlane(
+	const std::vector<Vector>& poly, const Vector& n, double d)
+{
+	if (poly.size() < 3) return {};
+	const double eps = 1e-6;
+	std::vector<Vector> neg, pos;
+	neg.reserve(poly.size() + 2);
+	pos.reserve(poly.size() + 2);
+
+	for (size_t i = 0; i < poly.size(); i++) {
+		const Vector& A = poly[i];
+		const Vector& B = poly[(i + 1) % poly.size()];
+		double da = dotp(A, n) - d;
+		double db = dotp(B, n) - d;
+		if (da <= eps) neg.push_back(A);
+		if (da >= -eps) pos.push_back(A);
+		if ((da < -eps && db > eps) || (da > eps && db < -eps)) {
+			double t = da / (da - db);
+			Vector M(A.x + (B.x - A.x) * t, A.y + (B.y - A.y) * t, A.z + (B.z - A.z) * t);
+			neg.push_back(M);
+			pos.push_back(M);
+		}
+	}
+
+	auto dedupLoop = [](std::vector<Vector>& v) {
+		std::vector<Vector> out;
+		out.reserve(v.size());
+		for (const auto& p : v) {
+			if (out.empty() || (p - out.back()).length2() > 1e-10)
+				out.push_back(p);
+		}
+		if (out.size() >= 2 && (out.front() - out.back()).length2() <= 1e-10)
+			out.pop_back();
+		return out;
+	};
+
+	neg = dedupLoop(neg);
+	pos = dedupLoop(pos);
+	std::vector<std::vector<Vector>> res;
+	if (neg.size() >= 3) res.push_back(std::move(neg));
+	if (pos.size() >= 3) res.push_back(std::move(pos));
+	return res;
+}
+
+static int ClassifyPointInDockCells(
+	const Vector& pt,
+	const std::vector<DockCellInfo>& cells,
+	const std::vector<DockClearFrame>& frames,
+	double clearRadius)
+{
+	const double clearR2 = clearRadius * clearRadius + 1e-6;
+	const double collarR2 = kDockCollarRadius * kDockCollarRadius + 1e-6;
+	for (const auto& c : cells) {
+		if (!c.inClearZ) continue;
+		const auto& df = frames[c.frameIdx];
+		Vector rel = pt - df.ref;
+		double u = dotp(rel, df.u);
+		double v = dotp(rel, df.v);
+		if (u * u + v * v <= clearR2)
+			return (int)(df.dockIdx + 1);
+	}
+	for (const auto& c : cells) {
+		if (!c.inCollarZ) continue;
+		const auto& df = frames[c.frameIdx];
+		Vector rel = pt - df.ref;
+		double u = dotp(rel, df.u);
+		double v = dotp(rel, df.v);
+		if (u * u + v * v <= collarR2)
+			return 100 + (int)df.dockIdx * 4 + c.sector;
+	}
+	return 0;
+}
+
 // Extracts vertices from external visual meshes into vessel-local coords.
 // Decomposes meshes into physical convex sub-colliders by connected triangle components,
-// carving out per-dock clear zones at the vertex level and splitting surrounding rings into
-// 4 radial sectors so convex hulls never bridge across a docking port axis.
+// carving out per-dock clear zones (splitting spanning triangles along zone boundaries) and
+// splitting surrounding rings into 4 radial sectors so convex hulls never bridge a docking axis.
 void Vessel::RebuildHullCache() {
 
   if (m_hullStaticValid) {
@@ -4846,18 +4940,13 @@ void Vessel::RebuildHullCache() {
   m_hullCacheStatic.reserve(4096);
 
   // Precompute orthonormal frames for each docking port
-  struct DockFrame {
-    Vector ref;
-    Vector dir; // axial unit vector
-    Vector u;   // radial axis 1
-    Vector v;   // radial axis 2
-  };
-  std::vector<DockFrame> dockFrames;
+  std::vector<DockClearFrame> dockFrames;
   DWORD maxDocks = min(ndock, (DWORD)32);
   dockFrames.reserve(maxDocks);
   for (DWORD d = 0; d < maxDocks; d++) {
     if (!dock[d]) continue;
-    DockFrame df;
+    DockClearFrame df;
+    df.dockIdx = d;
     df.ref = dock[d]->ref;
     df.dir = dock[d]->dir;
     if (df.dir.length2() > 1e-12) df.dir.unify();
@@ -4875,34 +4964,32 @@ void Vessel::RebuildHullCache() {
     dockFrames.push_back(df);
   }
 
-  auto classifyVertexDockBucket = [&](const VECTOR3& p) -> int {
-    Vector pv(p.x, p.y, p.z);
+  auto classifyVertexDockBucket = [&](const Vector& pv) -> int {
     // 1. Check if vertex is inside any dock's clear cylinder
-    for (size_t d = 0; d < dockFrames.size(); d++) {
-      Vector rel = pv - dockFrames[d].ref;
-      double z_ax = dotp(rel, dockFrames[d].dir);
+    for (const auto& df : dockFrames) {
+      Vector rel = pv - df.ref;
+      double z_ax = dotp(rel, df.dir);
       if (z_ax >= DockClearAxialMin && z_ax <= DockClearAxialMax) {
-        double u = dotp(rel, dockFrames[d].u);
-        double v = dotp(rel, dockFrames[d].v);
+        double u = dotp(rel, df.u);
+        double v = dotp(rel, df.v);
         if (u * u + v * v <= DockClearRadius * DockClearRadius) {
-          return (int)(d + 1); // 1..32: Clear zone for dock d
+          return (int)(df.dockIdx + 1); // 1..32: Clear zone for dock d
         }
       }
     }
     // 2. If outside the clear cylinder, check if it is in the surrounding collar/ring region
     //    around a dock and split into 4 radial sectors so its convex hull cannot bridge across (u=0, v=0)
-    for (size_t d = 0; d < dockFrames.size(); d++) {
-      Vector rel = pv - dockFrames[d].ref;
-      double z_ax = dotp(rel, dockFrames[d].dir);
-      if (z_ax >= DockClearAxialMin - 1.0 && z_ax <= DockClearAxialMax + 1.5) {
-        double u = dotp(rel, dockFrames[d].u);
-        double v = dotp(rel, dockFrames[d].v);
-        double r2 = u * u + v * v;
-        if (r2 <= 36.0) { // within 6.0m radial collar around the dock axis
+    for (const auto& df : dockFrames) {
+      Vector rel = pv - df.ref;
+      double z_ax = dotp(rel, df.dir);
+      if (z_ax >= DockClearAxialMin - kDockCollarAxialPadBack && z_ax <= DockClearAxialMax + kDockCollarAxialPadFwd) {
+        double u = dotp(rel, df.u);
+        double v = dotp(rel, df.v);
+        if (u * u + v * v <= kDockCollarRadius * kDockCollarRadius) {
           int sector = 0;
           if (fabs(u) >= fabs(v)) sector = (u >= 0.0) ? 0 : 1;
           else                    sector = (v >= 0.0) ? 2 : 3;
-          return 100 + (int)d * 4 + sector;
+          return 100 + (int)df.dockIdx * 4 + sector;
         }
       }
     }
@@ -4933,6 +5020,18 @@ void Vessel::RebuildHullCache() {
       struct PosKeyHash {
         size_t operator()(const PosKey& k) const {
           return (size_t)k.x * 73856093 ^ (size_t)k.y * 19349663 ^ (size_t)k.z * 83492791;
+        }
+      };
+      struct BucketPosKey {
+        int subBucket;
+        int x, y, z;
+        bool operator==(const BucketPosKey& o) const {
+          return subBucket == o.subBucket && x == o.x && y == o.y && z == o.z;
+        }
+      };
+      struct BucketPosKeyHash {
+        size_t operator()(const BucketPosKey& k) const {
+          return (size_t)k.subBucket * 9187 ^ (size_t)k.x * 73856093 ^ (size_t)k.y * 19349663 ^ (size_t)k.z * 83492791;
         }
       };
 
@@ -4997,28 +5096,162 @@ void Vessel::RebuildHullCache() {
         compTris[dsuFind(t)].push_back(t);
       }
 
+      // Conservative outer AABB half-extent enclosing any dock clear/collar zone from dock ref
+      const double dockBoxHalf = max(
+        fabs(DockClearAxialMin - kDockCollarAxialPadBack),
+        fabs(DockClearAxialMax + kDockCollarAxialPadFwd)) + kDockCollarRadius + 0.5;
+
       for (const auto& kv : compTris) {
         const auto& tris = kv.second;
         if (tris.empty()) continue;
 
-        std::unordered_map<PosKey, HullVertex, PosKeyHash> compPts;
+        std::unordered_map<BucketPosKey, HullVertex, BucketPosKeyHash> compPts;
+        auto addCompPt = [&](const Vector& pv, int bucket) {
+          VECTOR3 p = { pv.x, pv.y, pv.z };
+          BucketPosKey k = {
+            bucket,
+            (int)floor(p.x / 0.02 + 0.5),
+            (int)floor(p.y / 0.02 + 0.5),
+            (int)floor(p.z / 0.02 + 0.5)
+          };
+          if (compPts.find(k) == compPts.end()) {
+            compPts[k] = { p, mi, g, clusterCounter, bucket };
+          }
+        };
+
         for (int t : tris) {
+          Vector tri[3];
+          bool valid = true;
           for (int vi = 0; vi < 3; vi++) {
             WORD vIdx = grp->Idx[t * 3 + vi];
-            if (vIdx >= grp->nVtx) continue;
-            VECTOR3 p = {
-              (float)(grp->Vtx[vIdx].x + meshOfs.x),
-              (float)(grp->Vtx[vIdx].y + meshOfs.y),
-              (float)(grp->Vtx[vIdx].z + meshOfs.z)
-            };
-            PosKey k = {
-              (int)floor(p.x / 0.02 + 0.5),
-              (int)floor(p.y / 0.02 + 0.5),
-              (int)floor(p.z / 0.02 + 0.5)
-            };
-            if (compPts.find(k) == compPts.end()) {
-              int bucket = classifyVertexDockBucket(p);
-              compPts[k] = { p, mi, g, clusterCounter, bucket };
+            if (vIdx >= grp->nVtx) { valid = false; break; }
+            tri[vi].Set(
+              grp->Vtx[vIdx].x + meshOfs.x,
+              grp->Vtx[vIdx].y + meshOfs.y,
+              grp->Vtx[vIdx].z + meshOfs.z);
+          }
+          if (!valid) continue;
+
+          if (dockFrames.empty()) {
+            for (int vi = 0; vi < 3; vi++) addCompPt(tri[vi], 0);
+            continue;
+          }
+
+          Vector mn(min(tri[0].x, min(tri[1].x, tri[2].x)),
+                    min(tri[0].y, min(tri[1].y, tri[2].y)),
+                    min(tri[0].z, min(tri[1].z, tri[2].z)));
+          Vector mx(max(tri[0].x, max(tri[1].x, tri[2].x)),
+                    max(tri[0].y, max(tri[1].y, tri[2].y)),
+                    max(tri[0].z, max(tri[1].z, tri[2].z)));
+          std::vector<size_t> activeFrameIndices;
+          for (size_t fi = 0; fi < dockFrames.size(); fi++) {
+            const auto& df = dockFrames[fi];
+            if (mx.x >= df.ref.x - dockBoxHalf && mn.x <= df.ref.x + dockBoxHalf &&
+                mx.y >= df.ref.y - dockBoxHalf && mn.y <= df.ref.y + dockBoxHalf &&
+                mx.z >= df.ref.z - dockBoxHalf && mn.z <= df.ref.z + dockBoxHalf) {
+              activeFrameIndices.push_back(fi);
+            }
+          }
+
+          if (activeFrameIndices.empty()) {
+            for (int vi = 0; vi < 3; vi++) addCompPt(tri[vi], 0);
+            continue;
+          }
+          if (activeFrameIndices.size() == 1) {
+            int b0 = classifyVertexDockBucket(tri[0]);
+            if (b0 >= 1 && b0 <= 32) {
+              int b1 = classifyVertexDockBucket(tri[1]);
+              int b2 = classifyVertexDockBucket(tri[2]);
+              if (b0 == b1 && b1 == b2) {
+                for (int vi = 0; vi < 3; vi++) addCompPt(tri[vi], b0);
+                continue;
+              }
+            }
+          }
+
+          // Split triangle along axial band planes and radial sector planes of nearby docks
+          std::vector<std::vector<Vector>> subPolys = { { tri[0], tri[1], tri[2] } };
+          auto splitAllByPlane = [&](const Vector& n, double d) {
+            std::vector<std::vector<Vector>> next;
+            next.reserve(subPolys.size() * 2);
+            for (const auto& sp : subPolys) {
+              auto pieces = SplitConvexPolyByPlane(sp, n, d);
+              next.insert(next.end(),
+                std::make_move_iterator(pieces.begin()),
+                std::make_move_iterator(pieces.end()));
+            }
+            subPolys = std::move(next);
+          };
+
+          for (size_t fi : activeFrameIndices) {
+            const auto& df = dockFrames[fi];
+            double rd = dotp(df.ref, df.dir);
+            splitAllByPlane(df.dir, rd + DockClearAxialMin - kDockCollarAxialPadBack);
+            splitAllByPlane(df.dir, rd + DockClearAxialMin);
+            splitAllByPlane(df.dir, rd + DockClearAxialMax);
+            splitAllByPlane(df.dir, rd + DockClearAxialMax + kDockCollarAxialPadFwd);
+            Vector n1 = (df.u - df.v).unit();
+            Vector n2 = (df.u + df.v).unit();
+            splitAllByPlane(n1, dotp(df.ref, n1));
+            splitAllByPlane(n2, dotp(df.ref, n2));
+          }
+
+          for (const auto& sp : subPolys) {
+            Vector ctr(0, 0, 0);
+            for (const auto& q : sp) ctr += q;
+            ctr *= (1.0 / sp.size());
+
+            std::vector<DockCellInfo> cells;
+            cells.reserve(activeFrameIndices.size());
+            for (size_t fi : activeFrameIndices) {
+              const auto& df = dockFrames[fi];
+              Vector relC = ctr - df.ref;
+              double zc = dotp(relC, df.dir);
+              bool cz = (zc >= DockClearAxialMin && zc <= DockClearAxialMax);
+              bool kz = (zc >= DockClearAxialMin - kDockCollarAxialPadBack &&
+                         zc <= DockClearAxialMax + kDockCollarAxialPadFwd);
+              if (!cz && !kz) continue;
+              double uc = dotp(relC, df.u);
+              double vc = dotp(relC, df.v);
+              int sec = (fabs(uc) >= fabs(vc)) ? ((uc >= 0.0) ? 0 : 1) : ((vc >= 0.0) ? 2 : 3);
+              cells.push_back({ fi, cz, kz, sec });
+            }
+
+            for (size_t i = 0; i < sp.size(); i++) {
+              const Vector& A = sp[i];
+              const Vector& B = sp[(i + 1) % sp.size()];
+              addCompPt(A, ClassifyPointInDockCells(A, cells, dockFrames, DockClearRadius));
+
+              for (const auto& c : cells) {
+                const auto& df = dockFrames[c.frameIdx];
+                Vector rA = A - df.ref, rB = B - df.ref;
+                double ax0 = dotp(rA, df.u), ay0 = dotp(rA, df.v);
+                double ax1 = dotp(rB, df.u), ay1 = dotp(rB, df.v);
+                double dx = ax1 - ax0, dy = ay1 - ay0;
+                double aa = dx * dx + dy * dy;
+                if (aa <= 1e-10) continue;
+                double half_b = ax0 * dx + ay0 * dy;
+                auto emitCylinderRing = [&](double R) {
+                  double cc = ax0 * ax0 + ay0 * ay0 - R * R;
+                  double disc = half_b * half_b - aa * cc;
+                  if (disc < 0.0) return;
+                  double sq = sqrt(disc);
+                  double ts[2] = { (-half_b - sq) / aa, (-half_b + sq) / aa };
+                  for (double tc : ts) {
+                    if (tc <= 1e-4 || tc >= 1.0 - 1e-4) continue;
+                    Vector M(A.x + (B.x - A.x) * tc, A.y + (B.y - A.y) * tc, A.z + (B.z - A.z) * tc);
+                    double um = ax0 + dx * tc, vm = ay0 + dy * tc;
+                    double rl = sqrt(um * um + vm * vm);
+                    if (rl > 1e-6) {
+                      Vector radUnit = (df.u * um + df.v * vm) * (1.0 / rl);
+                      addCompPt(M, ClassifyPointInDockCells(M - radUnit * 1e-4, cells, dockFrames, DockClearRadius));
+                      addCompPt(M, ClassifyPointInDockCells(M + radUnit * 1e-4, cells, dockFrames, DockClearRadius));
+                    }
+                  }
+                };
+                if (c.inClearZ)  emitCylinderRing(DockClearRadius);
+                if (c.inCollarZ) emitCylinderRing(kDockCollarRadius);
+              }
             }
           }
         }
@@ -5036,11 +5269,12 @@ void Vessel::RebuildHullCache() {
           Vector n = crossp(e1, e2).unit();
           if (n.length() < 1e-6) n = Vector(0, 1, 0);
           VECTOR3 p3 = {
-            (float)((p0.x + p1.x + p2.x) / 3.0 + n.x * 0.02),
-            (float)((p0.y + p1.y + p2.y) / 3.0 + n.y * 0.02),
-            (float)((p0.z + p1.z + p2.z) / 3.0 + n.z * 0.02)
+            (p0.x + p1.x + p2.x) / 3.0 + n.x * 0.02,
+            (p0.y + p1.y + p2.y) / 3.0 + n.y * 0.02,
+            (p0.z + p1.z + p2.z) / 3.0 + n.z * 0.02
           };
-          PosKey k3 = {
+          BucketPosKey k3 = {
+            bucket0,
             (int)floor(p3.x / 0.02 + 0.5),
             (int)floor(p3.y / 0.02 + 0.5),
             (int)floor(p3.z / 0.02 + 0.5)

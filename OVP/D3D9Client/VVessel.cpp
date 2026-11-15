@@ -909,16 +909,18 @@ void vVessel::RenderColliders()
 		}
 	}
 
-	// Draw clear zones only when their real collision is actively suppressed
-	DWORD nBoxes = 0;
-	const VECTOR3* clearZones = vessel->GetCollisionClearZonesByState(true, nBoxes);
-	if (clearZones && nBoxes > 0) {
-		D3DXMATRIX id;
-		D3DXMatrixIdentity(&id);
-		for (DWORD i = 0; i < nBoxes; i++) {
-			D3DXVECTOR4 bmin((float)clearZones[i*2].x, (float)clearZones[i*2].y, (float)clearZones[i*2].z, 1.0f);
-			D3DXVECTOR4 bmax((float)clearZones[i*2+1].x, (float)clearZones[i*2+1].y, (float)clearZones[i*2+1].z, 1.0f);
-			D3D9Effect::RenderBoundingBox(&mWorld, &id, &bmin, &bmax, ptr(D3DXVECTOR4(0, 1, 1, 0.75f))); // Cyan box
+	// Draw clear zones only when their real collision is actively suppressed (gold boxes handle this when Docking Debug is enabled)
+	if (!Config->bShowDockingDebug) {
+		DWORD nBoxes = 0;
+		const VECTOR3* clearZones = vessel->GetCollisionClearZonesByState(true, nBoxes);
+		if (clearZones && nBoxes > 0) {
+			D3DXMATRIX id;
+			D3DXMatrixIdentity(&id);
+			for (DWORD i = 0; i < nBoxes; i++) {
+				D3DXVECTOR4 bmin((float)clearZones[i*2].x, (float)clearZones[i*2].y, (float)clearZones[i*2].z, 1.0f);
+				D3DXVECTOR4 bmax((float)clearZones[i*2+1].x, (float)clearZones[i*2+1].y, (float)clearZones[i*2+1].z, 1.0f);
+				D3D9Effect::RenderBoundingBox(&mWorld, &id, &bmin, &bmax, ptr(D3DXVECTOR4(0, 1, 1, 0.75f))); // Cyan box
+			}
 		}
 	}
 

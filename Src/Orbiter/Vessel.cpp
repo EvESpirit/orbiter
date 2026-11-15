@@ -6508,8 +6508,40 @@ void Vessel::ResolveCollisionWith(Vessel *v) {
 		RemoveDisabledCollisionPair(this, v);
 	}
 
-	// Relative velocity and position
+	// Sync docking approach timestamp and evaluate approach clear-zone masks before broad-phase early-returns,
+	// so clear zones suppress (both in physics and visuals) across the full <5m approach whenever all 3 criteria pass.
+	if (td.SimT1 != m_activeDockApproachTime) {
+		m_activeDockApproachMask = 0;
+		m_activeDockApproachTime = td.SimT1;
+	}
+	if (td.SimT1 != v->m_activeDockApproachTime) {
+		v->m_activeDockApproachMask = 0;
+		v->m_activeDockApproachTime = td.SimT1;
+	}
+
 	Vector pRel = v->s1->pos - s1->pos;
+	DWORD approachingMaskA = 0;
+	DWORD approachingMaskB = 0;
+	if (ndock > 0 && v->ndock > 0) {
+		auto maxDockReach = [](const Vessel *vs) -> double {
+			double r = vs->Size();
+			for (DWORD i = 0; i < min(vs->ndock, (DWORD)32); i++) {
+				if (vs->dock[i] && !vs->dock[i]->mate) {
+					double d = vs->dock[i]->ref.length();
+					if (d > r) r = d;
+				}
+			}
+			return r;
+		};
+		double dockBound = maxDockReach(this) + maxDockReach(v) + 5.5;
+		if (pRel.length2() <= dockBound * dockBound) {
+			ComputeDockApproachMasks(this, v, approachingMaskA, approachingMaskB);
+			m_activeDockApproachMask |= approachingMaskA;
+			v->m_activeDockApproachMask |= approachingMaskB;
+		}
+	}
+
+	// Relative velocity and broad-phase sphere check
 	Vector vRel = v->s1->vel - s1->vel;
 	double rsum = size + v->Size();
 
@@ -6562,15 +6594,6 @@ void Vessel::ResolveCollisionWith(Vessel *v) {
 	int hitSliceA = -1, hitMeshA = -1, hitGroupA = -1;
 	int hitSliceB = -1, hitMeshB = -1, hitGroupB = -1;
 
-	if (td.SimT1 != m_activeDockApproachTime) {
-		m_activeDockApproachMask = 0;
-		m_activeDockApproachTime = td.SimT1;
-	}
-	if (td.SimT1 != v->m_activeDockApproachTime) {
-		v->m_activeDockApproachMask = 0;
-		v->m_activeDockApproachTime = td.SimT1;
-	}
-
 	if (bIsConvexCollider && v->bIsConvexCollider) {
 		// Convex-to-Convex (Fast)
 		v->UpdateHullCacheP();
@@ -6581,12 +6604,6 @@ void Vessel::ResolveCollisionWith(Vessel *v) {
 			m_hullMaxP.z < v->m_hullMinP.z || m_hullMinP.z > v->m_hullMaxP.z) {
 			return;
 		}
-
-		DWORD approachingMaskA = 0;
-		DWORD approachingMaskB = 0;
-		ComputeDockApproachMasks(this, v, approachingMaskA, approachingMaskB);
-		m_activeDockApproachMask |= approachingMaskA;
-		v->m_activeDockApproachMask |= approachingMaskB;
 
 		std::vector<std::pair<const HullGroupSlice*, int>> activeB;
 		activeB.reserve(v->m_hullGroupSlices.size());
@@ -6658,10 +6675,8 @@ void Vessel::ResolveCollisionWith(Vessel *v) {
 		M_conc2p.tpremul(pp->s1->R);
 		Vector posConc_P(conc->s1->pos - pp->s1->pos);
 		posConc_P.Set(tmul(pp->s1->R, posConc_P));
-		DWORD approachingMaskConv = 0;
-		DWORD approachingMaskConc = 0;
-		ComputeDockApproachMasks(conv, conc, approachingMaskConv, approachingMaskConc);
-		bool convConcAabbOverlap = false;
+		DWORD approachingMaskConv = bIsConvexCollider ? approachingMaskA : approachingMaskB;
+		DWORD approachingMaskConc = bIsConvexCollider ? approachingMaskB : approachingMaskA;
 
 		CollisionCore::Simplex simplex;
 		simplex.reserve(4);
@@ -6691,12 +6706,6 @@ void Vessel::ResolveCollisionWith(Vessel *v) {
 					if (tmaxX < conv->m_hullMinP.x || tminX > conv->m_hullMaxP.x) continue;
 					if (tmaxY < conv->m_hullMinP.y || tminY > conv->m_hullMaxP.y) continue;
 					if (tmaxZ < conv->m_hullMinP.z || tminZ > conv->m_hullMaxP.z) continue;
-
-					if (!convConcAabbOverlap) {
-						convConcAabbOverlap = true;
-						conv->m_activeDockApproachMask |= approachingMaskConv;
-						conc->m_activeDockApproachMask |= approachingMaskConc;
-					}
 
 					VECTOR3 triPts[3] = {
 						{(float)t0.x, (float)t0.y, (float)t0.z},

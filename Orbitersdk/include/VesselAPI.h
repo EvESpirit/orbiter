@@ -2203,6 +2203,15 @@ public:
 	 * \param[out] axialMax axial end in front of dock ref [m] (positive)
 	 */
 	void GetDockClearCylinderParams (double &radius, double &axialMin, double &axialMax) const;
+
+	/**
+	 * \brief Returns generated triangle indices for docking clear-zone sub-hulls filtered by suppression state.
+	 * \param suppressed If true, returns only slices whose collision is currently suppressed by an active docking approach;
+	 *                   if false, returns idle clear-zone slices whose collision is currently active.
+	 * \param nIdx [out] Number of indices (always a multiple of 3)
+	 * \return Pointer to array of WORD indices into the point cloud, or NULL if none
+	 */
+	const WORD *GetCollisionClearZoneHullIndicesByState (bool suppressed, DWORD &nIdx) const;
 	//@}
 
 

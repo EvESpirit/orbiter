@@ -5126,144 +5126,155 @@ void Vessel::RebuildHullCache() {
   m_hullVisualValid = false;
 }
 
+static void BuildSliceConvexHullIndices(const std::vector<VECTOR3>& hullCache, const Vessel::HullGroupSlice& slice, std::vector<WORD>& targetIdx) {
+  if (slice.count < 3) return;
+  if (slice.startIdx + slice.count > hullCache.size()) return;
+  if (slice.startIdx + slice.count > 65535) return;
+
+  if (slice.count == 3) {
+      targetIdx.push_back((WORD)(slice.startIdx + 0));
+      targetIdx.push_back((WORD)(slice.startIdx + 1));
+      targetIdx.push_back((WORD)(slice.startIdx + 2));
+      return;
+  }
+
+  // 1. Create a jittered copy to eliminate degeneracies
+  std::vector<VECTOR3> pts(slice.count);
+  for (size_t i = 0; i < slice.count; i++) {
+      pts[i] = hullCache[slice.startIdx + i];
+      pts[i].x += (((double)rand() / RAND_MAX) - 0.5) * 1e-5;
+      pts[i].y += (((double)rand() / RAND_MAX) - 0.5) * 1e-5;
+      pts[i].z += (((double)rand() / RAND_MAX) - 0.5) * 1e-5;
+  }
+
+  auto getVec = [&](int i) -> Vector { return Vector(pts[i].x, pts[i].y, pts[i].z); };
+
+  int A = 0;
+  for (int i = 1; i < (int)pts.size(); i++) {
+      if (pts[i].x < pts[A].x) A = i;
+  }
+
+  int B = -1;
+  double max_dot = -1e9;
+  Vector n_fake(-1, 0, 0);
+  for (int i = 0; i < (int)pts.size(); i++) {
+      if (i == A) continue;
+      Vector d = (getVec(i) - getVec(A)).unit();
+      double d_dot = dotp(d, n_fake);
+      if (d_dot > max_dot) {
+          max_dot = d_dot;
+          B = i;
+      }
+  }
+
+  if (B == -1) return;
+
+  Vector e_dir = (getVec(B) - getVec(A)).unit();
+  Vector n_old = (n_fake - e_dir * dotp(n_fake, e_dir)).unit();
+  Vector Y_dir = crossp(e_dir, n_old).unit();
+
+  int C = -1;
+  double min_theta = 1e9;
+  for (int i = 0; i < (int)pts.size(); i++) {
+      if (i == A || i == B) continue;
+      Vector N_raw = crossp(getVec(A) - getVec(B), getVec(i) - getVec(B));
+      if (N_raw.length() < 1e-6) continue;
+      Vector N_new = N_raw.unit();
+      double x = dotp(N_new, n_old);
+      double y = dotp(N_new, Y_dir);
+      double theta = atan2(y, x);
+      if (theta < 0) theta += 2.0 * 3.14159265359;
+      if (theta < min_theta) {
+          min_theta = theta;
+          C = i;
+      }
+  }
+
+  if (C == -1) return;
+
+  Vector N_first = crossp(getVec(B) - getVec(A), getVec(C) - getVec(A)).unit();
+  int positive_count = 0;
+  for (int i = 0; i < (int)pts.size(); i++) {
+      if (dotp(N_first, getVec(i) - getVec(A)) > 1e-5) positive_count++;
+  }
+  if (positive_count > (int)pts.size() / 2) {
+      std::swap(B, C);
+      N_first = crossp(getVec(B) - getVec(A), getVec(C) - getVec(A)).unit();
+  }
+
+  targetIdx.push_back((WORD)(slice.startIdx + A));
+  targetIdx.push_back((WORD)(slice.startIdx + B));
+  targetIdx.push_back((WORD)(slice.startIdx + C));
+
+  struct Edge { int u, v; Vector n; };
+  std::vector<Edge> queue;
+  queue.push_back({A, B, N_first});
+  queue.push_back({B, C, N_first});
+  queue.push_back({C, A, N_first});
+
+  std::unordered_set<uint64_t> visited;
+
+  while (!queue.empty()) {
+      Edge edge = queue.back();
+      queue.pop_back();
+
+      uint64_t edge_hash = ((uint64_t)edge.u << 32) | (uint32_t)edge.v;
+      if (visited.find(edge_hash) != visited.end()) continue;
+      visited.insert(edge_hash);
+
+      int U = edge.u;
+      int V = edge.v;
+      Vector N_oldEdge = edge.n;
+
+      Vector e = (getVec(V) - getVec(U)).unit();
+      Vector Y = crossp(e, N_oldEdge).unit();
+
+      int W = -1;
+      double min_t = 1e9;
+      for (int i = 0; i < (int)pts.size(); i++) {
+          if (i == U || i == V) continue;
+          Vector N_raw = crossp(getVec(U) - getVec(V), getVec(i) - getVec(V));
+          if (N_raw.length() < 1e-6) continue;
+          Vector N_new = N_raw.unit();
+          double x = dotp(N_new, N_oldEdge);
+          double y = dotp(N_new, Y);
+          double theta = atan2(y, x);
+          if (theta < 0) theta += 2.0 * 3.14159265359;
+          if (theta < min_t) {
+              min_t = theta;
+              W = i;
+          }
+      }
+
+      if (W != -1) {
+          targetIdx.push_back((WORD)(slice.startIdx + V));
+          targetIdx.push_back((WORD)(slice.startIdx + U));
+          targetIdx.push_back((WORD)(slice.startIdx + W));
+
+          Vector N_new = crossp(getVec(U) - getVec(V), getVec(W) - getVec(V)).unit();
+
+          queue.push_back({U, W, N_new});
+          queue.push_back({W, V, N_new});
+      }
+  }
+}
+
 void Vessel::RebuildConvexHullVisual() {
+  m_convexHullAllIdx.clear();
   m_convexHullIdx.clear();
   m_convexHullClearIdx.clear();
+  m_convexHullClearIdleIdx.clear();
+  m_convexHullClearSuppressedIdx.clear();
+  m_convexHullBuiltMask = 0xFFFFFFFFu;
+  m_convexHullClearBuiltMask = 0xFFFFFFFFu;
+  m_convexHullClearBuilt = false;
   m_hullVisualValid = true;
   if (!bIsConvexCollider || m_hullGroupSlices.empty() || m_hullCache.empty()) return;
 
-  for (const auto& slice : m_hullGroupSlices) {
-      std::vector<WORD>& targetIdx = slice.isDockClearZone ? m_convexHullClearIdx : m_convexHullIdx;
-      if (slice.count < 3) continue;
-      if (slice.startIdx + slice.count > m_hullCache.size()) continue;
-      if (slice.startIdx + slice.count > 65535) continue;
-
-      if (slice.count == 3) {
-          targetIdx.push_back((WORD)(slice.startIdx + 0));
-          targetIdx.push_back((WORD)(slice.startIdx + 1));
-          targetIdx.push_back((WORD)(slice.startIdx + 2));
-          continue;
-      }
-
-      // 1. Create a jittered copy to eliminate degeneracies
-      std::vector<VECTOR3> pts(slice.count);
-      for (size_t i = 0; i < slice.count; i++) {
-          pts[i] = m_hullCache[slice.startIdx + i];
-          pts[i].x += (((double)rand() / RAND_MAX) - 0.5) * 1e-5;
-          pts[i].y += (((double)rand() / RAND_MAX) - 0.5) * 1e-5;
-          pts[i].z += (((double)rand() / RAND_MAX) - 0.5) * 1e-5;
-      }
-
-      auto getVec = [&](int i) -> Vector { return Vector(pts[i].x, pts[i].y, pts[i].z); };
-
-      int A = 0;
-      for (int i = 1; i < (int)pts.size(); i++) {
-          if (pts[i].x < pts[A].x) A = i;
-      }
-
-      int B = -1;
-      double max_dot = -1e9;
-      Vector n_fake(-1, 0, 0);
-      for (int i = 0; i < (int)pts.size(); i++) {
-          if (i == A) continue;
-          Vector d = (getVec(i) - getVec(A)).unit();
-          double d_dot = dotp(d, n_fake);
-          if (d_dot > max_dot) {
-              max_dot = d_dot;
-              B = i;
-          }
-      }
-
-      if (B != -1) {
-          Vector e_dir = (getVec(B) - getVec(A)).unit();
-          Vector n_old = (n_fake - e_dir * dotp(n_fake, e_dir)).unit();
-          Vector Y_dir = crossp(e_dir, n_old).unit();
-
-          int C = -1;
-          double min_theta = 1e9;
-          for (int i = 0; i < (int)pts.size(); i++) {
-              if (i == A || i == B) continue;
-              Vector N_raw = crossp(getVec(A) - getVec(B), getVec(i) - getVec(B));
-              if (N_raw.length() < 1e-6) continue;
-              Vector N_new = N_raw.unit();
-              double x = dotp(N_new, n_old);
-              double y = dotp(N_new, Y_dir);
-              double theta = atan2(y, x);
-              if (theta < 0) theta += 2.0 * 3.14159265359;
-              if (theta < min_theta) {
-                  min_theta = theta;
-                  C = i;
-              }
-          }
-
-          if (C != -1) {
-              Vector N_first = crossp(getVec(B) - getVec(A), getVec(C) - getVec(A)).unit();
-              int positive_count = 0;
-              for (int i = 0; i < (int)pts.size(); i++) {
-                  if (dotp(N_first, getVec(i) - getVec(A)) > 1e-5) positive_count++;
-              }
-              if (positive_count > (int)pts.size() / 2) {
-                  std::swap(B, C);
-                  N_first = crossp(getVec(B) - getVec(A), getVec(C) - getVec(A)).unit();
-              }
-
-              targetIdx.push_back((WORD)(slice.startIdx + A));
-              targetIdx.push_back((WORD)(slice.startIdx + B));
-              targetIdx.push_back((WORD)(slice.startIdx + C));
-
-              struct Edge { int u, v; Vector n; };
-              std::vector<Edge> queue;
-              queue.push_back({A, B, N_first});
-              queue.push_back({B, C, N_first});
-              queue.push_back({C, A, N_first});
-
-              std::unordered_set<uint64_t> visited;
-
-              while (!queue.empty()) {
-                  Edge edge = queue.back();
-                  queue.pop_back();
-
-                  uint64_t edge_hash = ((uint64_t)edge.u << 32) | (uint32_t)edge.v;
-                  if (visited.find(edge_hash) != visited.end()) continue;
-                  visited.insert(edge_hash);
-
-                  int U = edge.u;
-                  int V = edge.v;
-                  Vector N_old = edge.n;
-
-                  Vector e = (getVec(V) - getVec(U)).unit();
-                  Vector Y = crossp(e, N_old).unit();
-
-                  int W = -1;
-                  double min_t = 1e9;
-                  for (int i = 0; i < (int)pts.size(); i++) {
-                      if (i == U || i == V) continue;
-                      Vector N_raw = crossp(getVec(U) - getVec(V), getVec(i) - getVec(V));
-                      if (N_raw.length() < 1e-6) continue;
-                      Vector N_new = N_raw.unit();
-                      double x = dotp(N_new, N_old);
-                      double y = dotp(N_new, Y);
-                      double theta = atan2(y, x);
-                      if (theta < 0) theta += 2.0 * 3.14159265359;
-                      if (theta < min_t) {
-                          min_t = theta;
-                          W = i;
-                      }
-                  }
-
-                  if (W != -1) {
-                      targetIdx.push_back((WORD)(slice.startIdx + V));
-                      targetIdx.push_back((WORD)(slice.startIdx + U));
-                      targetIdx.push_back((WORD)(slice.startIdx + W));
-
-                      Vector N_new = crossp(getVec(U) - getVec(V), getVec(W) - getVec(V)).unit();
-
-                      queue.push_back({U, W, N_new});
-                      queue.push_back({W, V, N_new});
-                  }
-              }
-          }
-      }
+  for (auto& slice : m_hullGroupSlices) {
+      slice.visualIdxStart = m_convexHullAllIdx.size();
+      BuildSliceConvexHullIndices(m_hullCache, slice, m_convexHullAllIdx);
+      slice.visualIdxCount = m_convexHullAllIdx.size() - slice.visualIdxStart;
   }
 }
 void Vessel::CheckBaseCollisions(Planet *pp) {
@@ -6209,6 +6220,32 @@ void Vessel::RefreshCollisionOverlapState() {
 
 
 
+void Vessel::ComputeDockApproachMasks(const Vessel *a, const Vessel *b, DWORD &maskA, DWORD &maskB) {
+	maskA = 0;
+	maskB = 0;
+	if (!a || !b || a->ndock == 0 || b->ndock == 0) return;
+	for (DWORD i = 0; i < min(a->ndock, (DWORD)32); i++) {
+		if (!a->dock[i] || a->dock[i]->mate) continue;
+		Vector dockPosA = a->s1->pos + mul(a->s1->R, a->dock[i]->ref);
+		Vector dockDirA = mul(a->s1->R, a->dock[i]->dir).unit();
+		for (DWORD j = 0; j < min(b->ndock, (DWORD)32); j++) {
+			if (!b->dock[j] || b->dock[j]->mate) continue;
+			Vector dockPosB = b->s1->pos + mul(b->s1->R, b->dock[j]->ref);
+			Vector dockDirB = mul(b->s1->R, b->dock[j]->dir).unit();
+			Vector ab = dockPosB - dockPosA;
+			double dist = ab.length();
+			if (dist < 5.0 && dotp(dockDirA, dockDirB) < -0.8) {
+				bool inFront = (dist < 0.5) ||
+					(dotp(ab / dist, dockDirA) > 0.5 && dotp(ab / dist, dockDirB) < -0.5);
+				if (inFront) {
+					maskA |= (1u << i);
+					maskB |= (1u << j);
+				}
+			}
+		}
+	}
+}
+
 void Vessel::ResolveCollisionWith(Vessel *v) {
 	if (fstatus == FLIGHTSTATUS_LANDED && v->fstatus == FLIGHTSTATUS_LANDED) return;
 	if (!proxyplanet || proxyplanet != v->proxyplanet) return;
@@ -6313,28 +6350,7 @@ void Vessel::ResolveCollisionWith(Vessel *v) {
 
 		DWORD approachingMaskA = 0;
 		DWORD approachingMaskB = 0;
-		if (ndock > 0 && v->ndock > 0) {
-			for (DWORD i = 0; i < min(ndock, (DWORD)32); i++) {
-				if (!dock[i] || dock[i]->mate) continue;
-				Vector dockPosA = s1->pos + mul(s1->R, dock[i]->ref);
-				Vector dockDirA = mul(s1->R, dock[i]->dir).unit();
-				for (DWORD j = 0; j < min(v->ndock, (DWORD)32); j++) {
-					if (!v->dock[j] || v->dock[j]->mate) continue;
-					Vector dockPosB = v->s1->pos + mul(v->s1->R, v->dock[j]->ref);
-					Vector dockDirB = mul(v->s1->R, v->dock[j]->dir).unit();
-					Vector ab = dockPosB - dockPosA;
-					double dist = ab.length();
-					if (dist < 5.0 && dotp(dockDirA, dockDirB) < -0.8) {
-						bool inFront = (dist < 0.5) ||
-							(dotp(ab / dist, dockDirA) > 0.5 && dotp(ab / dist, dockDirB) < -0.5);
-						if (inFront) {
-							approachingMaskA |= (1u << i);
-							approachingMaskB |= (1u << j);
-						}
-					}
-				}
-			}
-		}
+		ComputeDockApproachMasks(this, v, approachingMaskA, approachingMaskB);
 		m_activeDockApproachMask |= approachingMaskA;
 		v->m_activeDockApproachMask |= approachingMaskB;
 
@@ -6408,22 +6424,10 @@ void Vessel::ResolveCollisionWith(Vessel *v) {
 		M_conc2p.tpremul(pp->s1->R);
 		Vector posConc_P(conc->s1->pos - pp->s1->pos);
 		posConc_P.Set(tmul(pp->s1->R, posConc_P));
-		bool dockingApproach = false;
-		if (conv->ndock > 0 && conc->ndock > 0) {
-			for (DWORD i = 0; i < conv->ndock; i++) {
-				Vector dockPosA = conv->s1->pos + mul(conv->s1->R, conv->dock[i]->ref);
-				Vector dockDirA = mul(conv->s1->R, conv->dock[i]->dir);
-				for (DWORD j = 0; j < conc->ndock; j++) {
-					Vector dockPosB = conc->s1->pos + mul(conc->s1->R, conc->dock[j]->ref);
-					Vector dockDirB = mul(conc->s1->R, conc->dock[j]->dir);
-					if (dockPosA.dist(dockPosB) < 5.0 && dotp(dockDirA, dockDirB) < -0.8) {
-						dockingApproach = true;
-						break;
-					}
-				}
-				if (dockingApproach) break;
-			}
-		}
+		DWORD approachingMaskConv = 0;
+		DWORD approachingMaskConc = 0;
+		ComputeDockApproachMasks(conv, conc, approachingMaskConv, approachingMaskConc);
+		bool convConcAabbOverlap = false;
 
 		CollisionCore::Simplex simplex;
 		simplex.reserve(4);
@@ -6454,16 +6458,25 @@ void Vessel::ResolveCollisionWith(Vessel *v) {
 					if (tmaxY < conv->m_hullMinP.y || tminY > conv->m_hullMaxP.y) continue;
 					if (tmaxZ < conv->m_hullMinP.z || tminZ > conv->m_hullMaxP.z) continue;
 
+					if (!convConcAabbOverlap) {
+						convConcAabbOverlap = true;
+						conv->m_activeDockApproachMask |= approachingMaskConv;
+						conc->m_activeDockApproachMask |= approachingMaskConc;
+					}
+
 					VECTOR3 triPts[3] = {
 						{(float)t0.x, (float)t0.y, (float)t0.z},
 						{(float)t1.x, (float)t1.y, (float)t1.z},
 						{(float)t2.x, (float)t2.y, (float)t2.z}
 					};
 
-					for (const auto& sliceA : conv->m_hullGroupSlices) {
-						if (dockingApproach && sliceA.isDockClearZone) {
+					for (size_t ai = 0; ai < conv->m_hullGroupSlices.size(); ai++) {
+						const auto& sliceA = conv->m_hullGroupSlices[ai];
+						if (sliceA.dockClearMask & approachingMaskConv) continue;
+						if (approachingMaskConc) {
 							bool nearDock = false;
-							for (DWORD d = 0; d < conc->ndock; d++) {
+							for (DWORD d = 0; d < min(conc->ndock, (DWORD)32); d++) {
+								if (!(approachingMaskConc & (1u << d)) || !conc->dock[d]) continue;
 								Vector dockPosP = conc->s1->pos - pp->s1->pos + mul(conc->s1->R, conc->dock[d]->ref);
 								dockPosP.Set(tmul(pp->s1->R, dockPosP));
 								if (t0.dist2(dockPosP) < 9.0 || t1.dist2(dockPosP) < 9.0 || t2.dist2(dockPosP) < 9.0) {
@@ -6494,9 +6507,15 @@ void Vessel::ResolveCollisionWith(Vessel *v) {
 										cLocal.Set(tmul(s1->R, cLocal));
 										bestRes.contactPtLocal = { (float)cLocal.x, (float)cLocal.y, (float)cLocal.z };
 										bestResFromB = false;
+										hitSliceA = (int)ai;
+										hitMeshA  = (int)sliceA.meshIdx;
+										hitGroupA = (int)sliceA.groupIdx;
+										hitSliceB = -1;
+										hitMeshB  = (int)mi;
+										hitGroupB = (int)g;
 
 #ifdef VESSEL_COLLISION_DEBUG
-										oapiWriteLogV("COLLISION Convex: depth=%.3f, dockApproach=%d, sliceA.dock=%d", depth, dockingApproach, sliceA.isDockClearZone);
+										oapiWriteLogV("COLLISION Convex: depth=%.3f, dockApproach=%d, sliceA.dock=%d", depth, (approachingMaskConv != 0), sliceA.isDockClearZone);
 #endif
 									} else {
 										// normal points out of B (conv) towards A (conc). We need B to A.
@@ -6507,6 +6526,12 @@ void Vessel::ResolveCollisionWith(Vessel *v) {
 										cLocal.Set(tmul(v->s1->R, cLocal));
 										bestRes.contactPtLocal = { (float)cLocal.x, (float)cLocal.y, (float)cLocal.z };
 										bestResFromB = true;
+										hitSliceA = -1;
+										hitMeshA  = (int)mi;
+										hitGroupA = (int)g;
+										hitSliceB = (int)ai;
+										hitMeshB  = (int)sliceA.meshIdx;
+										hitGroupB = (int)sliceA.groupIdx;
 									}
 								}
 							}
@@ -10364,11 +10389,50 @@ const VECTOR3 *VESSEL::GetCollisionPointCloud (DWORD &nPts) const
 	return &(vessel->m_hullCache[0]);
 }
 
+DWORD Vessel::GetEffectiveDockApproachMask() const
+{
+	if (!g_pOrbiter->Cfg()->CfgPhysicsPrm.bVesselCollision) return 0;
+	extern TimeData td;
+	if (m_activeDockApproachMask == 0 || td.SimT1 > m_activeDockApproachTime + 0.25) return 0;
+	DWORD validFreeMask = 0;
+	for (DWORD d = 0; d < min(ndock, (DWORD)32); d++) {
+		if (dock[d] && !dock[d]->mate) validFreeMask |= (1u << d);
+	}
+	return m_activeDockApproachMask & validFreeMask;
+}
+
+void Vessel::RebuildFilteredHullIndices(std::vector<WORD>& out, bool includeSolid, bool includeIdleClear, bool includeSuppressedClear, DWORD activeMask) const
+{
+	out.clear();
+	out.reserve(m_convexHullAllIdx.size());
+	for (const auto& slice : m_hullGroupSlices) {
+		if (slice.visualIdxCount == 0) continue;
+		if (!slice.isDockClearZone) {
+			if (!includeSolid) continue;
+		} else {
+			bool suppressed = ((slice.dockClearMask & activeMask) != 0);
+			if (suppressed ? !includeSuppressedClear : !includeIdleClear) continue;
+		}
+		out.insert(
+			out.end(),
+			m_convexHullAllIdx.begin() + slice.visualIdxStart,
+			m_convexHullAllIdx.begin() + slice.visualIdxStart + slice.visualIdxCount
+		);
+	}
+}
+
 const WORD *VESSEL::GetCollisionHullIndices (DWORD &nIdx) const
 {
 	vessel->RebuildHullCache();
 	vessel->ApplyAnimationToHullCache();
 	if (!vessel->m_hullVisualValid) vessel->RebuildConvexHullVisual();
+
+	DWORD activeMask = vessel->GetEffectiveDockApproachMask();
+	if (vessel->m_convexHullBuiltMask != activeMask) {
+		vessel->RebuildFilteredHullIndices(vessel->m_convexHullIdx, true, true, false, activeMask);
+		vessel->m_convexHullBuiltMask = activeMask;
+	}
+
 	if (vessel->m_convexHullIdx.empty()) {
 		nIdx = 0;
 		return NULL;
@@ -10420,6 +10484,10 @@ const WORD *VESSEL::GetCollisionClearZoneHullIndices (DWORD &nIdx) const
 	vessel->RebuildHullCache();
 	vessel->ApplyAnimationToHullCache();
 	if (!vessel->m_hullVisualValid) vessel->RebuildConvexHullVisual();
+	if (!vessel->m_convexHullClearBuilt) {
+		vessel->RebuildFilteredHullIndices(vessel->m_convexHullClearIdx, false, true, true, 0);
+		vessel->m_convexHullClearBuilt = true;
+	}
 	if (vessel->m_convexHullClearIdx.empty()) {
 		nIdx = 0;
 		return NULL;
@@ -10428,13 +10496,35 @@ const WORD *VESSEL::GetCollisionClearZoneHullIndices (DWORD &nIdx) const
 	return &(vessel->m_convexHullClearIdx[0]);
 }
 
+const WORD *VESSEL::GetCollisionClearZoneHullIndicesByState (bool suppressed, DWORD &nIdx) const
+{
+	vessel->RebuildHullCache();
+	vessel->ApplyAnimationToHullCache();
+	if (!vessel->m_hullVisualValid) vessel->RebuildConvexHullVisual();
+
+	DWORD activeMask = vessel->GetEffectiveDockApproachMask();
+	if (vessel->m_convexHullClearBuiltMask != activeMask) {
+		vessel->RebuildFilteredHullIndices(vessel->m_convexHullClearIdleIdx, false, true, false, activeMask);
+		vessel->RebuildFilteredHullIndices(vessel->m_convexHullClearSuppressedIdx, false, false, true, activeMask);
+		vessel->m_convexHullClearBuiltMask = activeMask;
+	}
+
+	const std::vector<WORD>& buf = suppressed ? vessel->m_convexHullClearSuppressedIdx : vessel->m_convexHullClearIdleIdx;
+	if (buf.empty()) {
+		nIdx = 0;
+		return NULL;
+	}
+	nIdx = (DWORD)buf.size();
+	return &(buf[0]);
+}
+
 void VESSEL::GetDockingCollisionDebug (DWORD &activeDockMask, DWORD &nTotalSlices, DWORD &nClearSlices,
 	int &hitSliceA, int &hitMeshA, int &hitGroupA, OBJHANDLE &hHitOther) const
 {
 	vessel->RebuildHullCache();
 	vessel->ApplyAnimationToHullCache();
 
-	activeDockMask = (td.SimT1 <= vessel->m_activeDockApproachTime + 0.25) ? vessel->m_activeDockApproachMask : 0;
+	activeDockMask = vessel->GetEffectiveDockApproachMask();
 	nTotalSlices = (DWORD)vessel->m_hullGroupSlices.size();
 	nClearSlices = 0;
 	for (const auto& s : vessel->m_hullGroupSlices) {

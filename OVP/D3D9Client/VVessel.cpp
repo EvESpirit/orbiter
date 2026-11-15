@@ -968,30 +968,33 @@ void vVessel::RenderDockingDebug()
 	OBJHANDLE hHitOther = NULL;
 	vessel->GetDockingCollisionDebug(activeDockMask, nTotalSlices, nClearSlices, hitSliceA, hitMeshA, hitGroupA, hHitOther);
 
-	// 1. Render the actual convex sub-hull wireframes of the Clear-Zone slices
-	//    Colored Bright Gold if any port on this vessel is in active approach, or Cyan if idle
+	// 1. Render the actual convex sub-hull wireframes of the Clear-Zone slices per-port:
+	//    Bright Gold/Yellow for slices actively suppressed by dockingApproach, Cyan for idle clear zones
 	DWORD nPts = 0;
 	const VECTOR3 *pts = vessel->GetCollisionPointCloud(nPts);
-	DWORD nClearIdx = 0;
-	const WORD *clearIdx = vessel->GetCollisionClearZoneHullIndices(nClearIdx);
+	DWORD nIdleIdx = 0;
+	const WORD *idleIdx = vessel->GetCollisionClearZoneHullIndicesByState(false, nIdleIdx);
+	DWORD nSuppIdx = 0;
+	const WORD *suppIdx = vessel->GetCollisionClearZoneHullIndicesByState(true, nSuppIdx);
 
-	D3DCOLOR clearHullColor = (activeDockMask != 0)
-		? D3DCOLOR_RGBA(255, 220, 0, 220)   // Gold/Yellow: Clear zone actively suppressed!
-		: D3DCOLOR_RGBA(0, 220, 255, 160);  // Cyan: Clear zone idle
-
-	if (pts && nPts > 0 && clearIdx && nClearIdx > 0) {
+	if (pts && nPts > 0 && ((idleIdx && nIdleIdx > 0) || (suppIdx && nSuppIdx > 0))) {
 		std::vector<D3DXVECTOR3> dbgVtx(nPts);
 		for (DWORD i = 0; i < nPts; i++) {
 			dbgVtx[i] = D3DXVECTOR3((float)pts[i].x, (float)pts[i].y, (float)pts[i].z);
 		}
-		std::vector<WORD> dbgIdx;
-		dbgIdx.reserve(nClearIdx * 2);
-		for (DWORD i = 0; i < nClearIdx; i += 3) {
-			dbgIdx.push_back(clearIdx[i]);   dbgIdx.push_back(clearIdx[i+1]);
-			dbgIdx.push_back(clearIdx[i+1]); dbgIdx.push_back(clearIdx[i+2]);
-			dbgIdx.push_back(clearIdx[i+2]); dbgIdx.push_back(clearIdx[i]);
-		}
-		D3D9Effect::RenderLines(dbgVtx.data(), dbgIdx.data(), dbgVtx.size(), dbgIdx.size(), &mWorld, clearHullColor);
+		auto drawHullEdges = [&](const WORD *idx, DWORD nIdx, D3DCOLOR color) {
+			if (!idx || nIdx == 0) return;
+			std::vector<WORD> dbgIdx;
+			dbgIdx.reserve(nIdx * 2);
+			for (DWORD i = 0; i < nIdx; i += 3) {
+				dbgIdx.push_back(idx[i]);   dbgIdx.push_back(idx[i+1]);
+				dbgIdx.push_back(idx[i+1]); dbgIdx.push_back(idx[i+2]);
+				dbgIdx.push_back(idx[i+2]); dbgIdx.push_back(idx[i]);
+			}
+			D3D9Effect::RenderLines(dbgVtx.data(), dbgIdx.data(), dbgVtx.size(), dbgIdx.size(), &mWorld, color);
+		};
+		drawHullEdges(idleIdx, nIdleIdx, D3DCOLOR_RGBA(0, 220, 255, 160));   // Cyan: Clear zone idle (collision active)
+		drawHullEdges(suppIdx, nSuppIdx, D3DCOLOR_RGBA(255, 220, 0, 220));   // Gold/Yellow: Clear zone actively suppressed!
 	}
 
 	// 2. Render Clear-Zone AABB boxes

@@ -87,6 +87,7 @@ public:
 		bool loadAuxMaps = true);
 
 	bool CopyFromHBITMAP(HBITMAP hbm, int srcX, int srcY, int srcW, int srcH);
+	bool UploadBgra(const uint8_t *bgra, size_t byteSize);
 	bool ReadbackBgra(std::vector<uint8_t> &outBgra, uint32_t &outWidth, uint32_t &outHeight);
 	bool Decompress();
 	bool Fill(const RECT *rect, DWORD col);

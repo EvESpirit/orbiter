@@ -14,7 +14,10 @@
 #include "VkContext.h"
 #include "VkSwapchain.h"
 #include "VkBlit.h"
+#include "VkPad.h"
 #include "VkSurface.h"
+#include "VkTextMgr.h"
+#include "VkPadTools.h"
 #include "VkLog.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
@@ -43,126 +46,6 @@ std::string NormalizeTexKey(const char *fname)
 	}
 	return key;
 }
-
-// STUB (Unit 1.3): Minimal font handle replaced by VkPadFont in Unit 1.3
-class VkPhase0FontStub : public oapi::Font {
-public:
-	VkPhase0FontStub(int height, bool prop, const char *face, FontStyle style, int orientation)
-		: oapi::Font(height, prop, face, style, orientation)
-		, cellH(height != 0 ? (height > 0 ? height : -height) : 14)
-	{}
-	int cellH;
-};
-
-// STUB (Unit 1.3): Minimal pen handle replaced by VkPadPen in Unit 1.3
-class VkPhase0PenStub : public oapi::Pen {
-public:
-	VkPhase0PenStub(int style, int width, DWORD col) : oapi::Pen(style, width, col) {}
-};
-
-// STUB (Unit 1.3): Minimal brush handle replaced by VkPadBrush in Unit 1.3
-class VkPhase0BrushStub : public oapi::Brush {
-public:
-	explicit VkPhase0BrushStub(DWORD col) : oapi::Brush(col) {}
-};
-
-// STUB (Unit 1.3): Safe no-op Sketchpad replaced by VkPad in Unit 1.3.
-// Base oapi::Sketchpad methods contain assert(false) and vessels dereference
-// Sketchpad* during panel/MFD setup, so all virtual methods are safely stubbed.
-class VkPhase0SketchpadStub : public oapi::Sketchpad {
-public:
-	VkPhase0SketchpadStub(SURFHANDLE s, DWORD defW, DWORD defH)
-		: oapi::Sketchpad(s), surfW(defW), surfH(defH)
-	{
-		if (s && g_vkClient) {
-			const auto *st = reinterpret_cast<const VkSurfNative *>(s);
-			if (g_vkClient->IsValidSurface(st)) {
-				surfW = st->GetWidth();
-				surfH = st->GetHeight();
-			}
-		}
-	}
-
-	Font *SetFont(Font *f) override { Font *prev = curFont; curFont = f; return prev; } // STUB
-	Pen *SetPen(Pen *p) override { Pen *prev = curPen; curPen = p; return prev; } // STUB
-	Brush *SetBrush(Brush *b) override { Brush *prev = curBrush; curBrush = b; return prev; } // STUB
-	void SetTextAlign(TAlign_horizontal = LEFT, TAlign_vertical = TOP) override {} // STUB
-	DWORD SetTextColor(DWORD col) override { DWORD prev = textCol; textCol = col; return prev; } // STUB
-	DWORD SetBackgroundColor(DWORD col) override { DWORD prev = bgCol; bgCol = col; return prev; } // STUB
-	void SetBackgroundMode(BkgMode) override {} // STUB
-	DWORD GetCharSize() override { return (8u << 16) | 14u; } // STUB: non-zero metrics prevent divide-by-zero
-	DWORD GetTextWidth(const char *str, int len = 0) override { // STUB
-		if (!str) return 0;
-		size_t n = (len > 0) ? (size_t)len : std::strlen(str);
-		return (DWORD)(n * 8);
-	}
-	void SetOrigin(int x, int y) override { origX = x; origY = y; } // STUB
-	void GetOrigin(int *x, int *y) const override { if (x) *x = origX; if (y) *y = origY; } // STUB
-	bool Text(int, int, const char *, int) override { return true; } // STUB
-	void Pixel(int, int, DWORD) override {} // STUB
-	void MoveTo(int, int) override {} // STUB
-	void LineTo(int, int) override {} // STUB
-	void Line(int, int, int, int) override {} // STUB
-	void Rectangle(int, int, int, int) override {} // STUB
-	void Ellipse(int, int, int, int) override {} // STUB
-	void Polygon(const IVECTOR2 *, int) override {} // STUB
-	void Polyline(const IVECTOR2 *, int) override {} // STUB
-	void GetRenderSurfaceSize(LPSIZE size) override { // STUB
-		if (size) { size->cx = (LONG)surfW; size->cy = (LONG)surfH; }
-	}
-	void QuickPen(DWORD, float = 1.0f, DWORD = 1) override {} // STUB
-	void QuickBrush(DWORD) override {} // STUB
-	void SetGlobalLineScale(float = 1.0f, float = 1.0f) override {} // STUB
-	void SetWorldTransform(const FMATRIX4 * = NULL) override {} // STUB
-	const FMATRIX4 *ViewMatrix() const override { return &identMat; } // STUB
-	const FMATRIX4 *ProjectionMatrix() const override { return &identMat; } // STUB
-	const FMATRIX4 *GetViewProjectionMatrix() const override { return &identMat; } // STUB
-	void SetViewMode(SkpView = ORTHO) override {} // STUB
-	void SetWorldTransform2D(float = 1.0f, float = 0.0f, const IVECTOR2 * = NULL, const IVECTOR2 * = NULL) override {} // STUB
-	void ClipRect(const LPRECT = NULL) override {} // STUB
-	void Clipper(int, const VECTOR3 * = NULL, double = 0.0, double = 0.0) override {} // STUB
-	void DepthEnable(bool) override {} // STUB
-	int DrawMeshGroup(const MESHHANDLE, DWORD, MeshFlags = MeshFlags::SMOOTH_SHADE, const SURFHANDLE = NULL) override { return 0; } // STUB
-	void CopyRect(const SURFHANDLE, const LPRECT, int, int) override {} // STUB
-	void StretchRect(const SURFHANDLE, const LPRECT = NULL, const LPRECT = NULL) override {} // STUB
-	void RotateRect(const SURFHANDLE, const LPRECT, int, int, float = 0.0f, float = 1.0f, float = 1.0f) override {} // STUB
-	void ColorKey(const SURFHANDLE, const LPRECT, int, int) override {} // STUB
-	void TextEx(float, float, const char *, float = 1.0f, float = 0.0f) override {} // STUB
-	void DrawPoly(const HPOLY, DWORD = 0) override {} // STUB
-	void Lines(const FVECTOR2 *, int) override {} // STUB
-	void SetViewMatrix(const FMATRIX4 * = NULL) override {} // STUB
-	void SetProjectionMatrix(const FMATRIX4 * = NULL) override {} // STUB
-	const FMATRIX4 *GetColorMatrix() override { return &identMat; } // STUB
-	void SetColorMatrix(const FMATRIX4 * = NULL) override {} // STUB
-	void SetBrightness(const FVECTOR4 * = NULL) override {} // STUB
-	FVECTOR4 GetRenderParam(RenderParam) override { return FVECTOR4(0, 0, 0, 0); } // STUB
-	void SetRenderParam(RenderParam, const FVECTOR4 * = NULL) override {} // STUB
-	void SetBlendState(BlendState = (BlendState)(BlendState::ALPHABLEND | BlendState::FILTER_LINEAR)) override {} // STUB
-	void PushWorldTransform() override {} // STUB
-	void PopWorldTransform() override {} // STUB
-	void SetWorldScaleTransform2D(const FVECTOR2 * = NULL, const IVECTOR2 * = NULL) override {} // STUB
-	void GradientFillRect(const LPRECT, DWORD, DWORD, bool = false) override {} // STUB
-	void ColorFill(DWORD, const LPRECT) override {} // STUB
-	void StretchRegion(const skpRegion *, const SURFHANDLE, const LPRECT) override {} // STUB
-	void CopyTetragon(const SURFHANDLE, const LPRECT, const FVECTOR2[4]) override {} // STUB
-	void FillTetragon(DWORD, const FVECTOR2[4]) override {} // STUB
-	void ColorCompatibility(bool) override {} // STUB
-	void Clear(DWORD = 0, bool = true, bool = true) override {} // STUB
-	void SetClipDistance(float, float) override {} // STUB
-	void SetWorldBillboard(const FVECTOR3 &, float = 1.0f, bool = true, const FVECTOR3 * = NULL) override {} // STUB
-
-private:
-	DWORD surfW = 1280;
-	DWORD surfH = 720;
-	int origX = 0;
-	int origY = 0;
-	DWORD textCol = 0xFFFFFF;
-	DWORD bgCol = 0;
-	Font *curFont = nullptr;
-	Pen *curPen = nullptr;
-	Brush *curBrush = nullptr;
-	FMATRIX4 identMat{};
-};
 
 // Restyle Orbiter's 10x10 fullscreen dummy popup into a borderless window.
 // Exclusive fullscreen is never used, so styles 0 and 1 are identical here.
@@ -267,11 +150,22 @@ VulkanClient::~VulkanClient()
 {
 	if (imguiInitialized)
 		clbkImGuiShutdown();
+	if (skpPipeline) {
+		skpPipeline->FlushActivePads();
+		skpPipeline.reset();
+	}
+	if (defaultFont) {
+		clbkReleaseFont(defaultFont);
+		defaultFont = nullptr;
+	}
 	DestroyAllSurfaces();
+	VkFontCache::ReleaseGpuResources();
 	blitter.reset();
 	swapchain.reset();
 	ctx.reset();
 	stubParticleStreams.clear();
+	DestroyAllDrawingTools();
+	VkFontCache::Clear();
 	vtab.reset();
 }
 
@@ -412,6 +306,14 @@ HWND VulkanClient::clbkCreateRenderWindow()
 		blitter.reset();
 		VkLogWarn("VkBlitPipeline creation failed; scaled/color-keyed blits are disabled");
 	}
+
+	skpPipeline = std::make_unique<VkPadPipeline>();
+	if (!skpPipeline->Init(*ctx, *swapchain)) {
+		skpPipeline.reset();
+		VkLogWarn("VkPadPipeline initialisation failed; 2D Sketchpad rendering is disabled");
+	}
+	if (!defaultFont)
+		defaultFont = clbkCreateFont(20, true, "fixed");
 
 	viewW = swapchain->Extent().width;
 	viewH = swapchain->Extent().height;
@@ -583,12 +485,45 @@ void VulkanClient::DestroyAllSurfaces()
 	frameCounter = 0;
 }
 
+// Drawing tools do not hold device resources, so they are not tied to a session
+// (modules such as DeltaGlider create pens in InitModule and release them in ExitModule,
+// which may run after this client is unregistered).
+void VulkanClient::DestroyAllDrawingTools()
+{
+	if (!fontCatalog.empty())
+		VkLogInfo("Freeing %zu fonts still held at module exit", fontCatalog.size());
+	for (Font *f : fontCatalog)
+		delete static_cast<VkPadFont *>(f);
+	fontCatalog.clear();
+
+	if (!penCatalog.empty())
+		VkLogInfo("Freeing %zu pens still held at module exit", penCatalog.size());
+	for (Pen *p : penCatalog)
+		delete static_cast<VkPadPen *>(p);
+	penCatalog.clear();
+
+	if (!brushCatalog.empty())
+		VkLogInfo("Freeing %zu brushes still held at module exit", brushCatalog.size());
+	for (Brush *b : brushCatalog)
+		delete static_cast<VkPadBrush *>(b);
+	brushCatalog.clear();
+}
+
 void VulkanClient::clbkDestroyRenderWindow(bool fastclose)
 {
 	VkLogAlw("================ clbkDestroyRenderWindow ================");
 	if (imguiInitialized)
 		clbkImGuiShutdown();
+	if (skpPipeline) {
+		skpPipeline->FlushActivePads();
+		skpPipeline.reset();
+	}
+	if (defaultFont) {
+		clbkReleaseFont(defaultFont);
+		defaultFont = nullptr;
+	}
 	DestroyAllSurfaces();
+	VkFontCache::ReleaseGpuResources();
 	blitter.reset();
 	GraphicsClient::clbkDestroyRenderWindow(fastclose);
 	swapchain.reset();
@@ -1063,6 +998,8 @@ bool VulkanClient::clbkReleaseSurface(SURFHANDLE surf)
 		return false;
 
 	if (s->DecRef()) {
+		if (skpPipeline)
+			skpPipeline->OnSurfaceDestroyed(surf);
 		if (bltGroupTgt == surf)
 			bltGroupTgt = RENDERTGT_NONE;
 		surfaceCatalog.erase(it);
@@ -1530,64 +1467,86 @@ void VulkanClient::clbkReleaseSurfaceDC(SURFHANDLE surf, HDC hDC)
 }
 
 // ==============================================================
-// Phase 1 (Unit 1.3) / Phase 4 Placeholders
+// Sketchpad (Unit 1.3) / Phase 4 Placeholders
 // ==============================================================
 
 Sketchpad *VulkanClient::clbkGetSketchpad(SURFHANDLE surf)
 {
-	// STUB (Unit 1.3)
-	return new VkPhase0SketchpadStub(surf, viewW, viewH);
+	if (!skpPipeline)
+		return nullptr;
+	if (!defaultFont)
+		defaultFont = clbkCreateFont(20, true, "fixed");
+	return skpPipeline->AcquirePad(*this, defaultFont, surf);
 }
 
 void VulkanClient::clbkReleaseSketchpad(Sketchpad *sp)
 {
-	// STUB (Unit 1.3)
-	delete sp;
+	if (!skpPipeline) {
+		delete sp;
+		return;
+	}
+	skpPipeline->ReleasePad(sp);
 }
 
 Font *VulkanClient::clbkCreateFont(int height, bool prop, const char *face, FontStyle style, int orientation) const
 {
-	// STUB (Unit 1.3)
-	return new VkPhase0FontStub(height, prop, face ? face : "Sans", style, orientation);
+	auto *font = new VkPadFont(height, prop, face, style, orientation);
+	if (!font->IsValid())
+		VkLogWarn("clbkCreateFont: no glyph atlas for '%s' height %d", face ? face : "(null)", height);
+	fontCatalog.insert(font);
+#ifdef VKCLIENT_FONT_DEBUG
+	if (ctx && swapchain && font->IsValid())
+		font->Atlas()->GetSurface(*ctx, *swapchain); // Upload immediately to exercise the GPU readback check
+#endif
+	return font;
 }
 
 Font *VulkanClient::clbkCreateFontEx(int height, char *face, int width, int weight, FontStyle style, float spacing) const
 {
-	// STUB (Unit 1.3)
-	(void)width;
-	(void)weight;
-	(void)spacing;
-	return new VkPhase0FontStub(height, true, face ? face : "Sans", style, 0);
+	auto *font = new VkPadFont(height, face, width, weight, style, spacing);
+	if (!font->IsValid())
+		VkLogWarn("clbkCreateFontEx: no glyph atlas for '%s' height %d", face ? face : "(null)", height);
+	fontCatalog.insert(font);
+#ifdef VKCLIENT_FONT_DEBUG
+	if (ctx && swapchain && font->IsValid())
+		font->Atlas()->GetSurface(*ctx, *swapchain); // Upload immediately to exercise the GPU readback check
+#endif
+	return font;
 }
 
 void VulkanClient::clbkReleaseFont(Font *font) const
 {
-	// STUB (Unit 1.3)
-	delete font;
+	if (!font || fontCatalog.erase(font) == 0)
+		return;
+	delete static_cast<VkPadFont *>(font);
 }
 
 Pen *VulkanClient::clbkCreatePen(int style, int width, DWORD col) const
 {
-	// STUB (Unit 1.3)
-	return new VkPhase0PenStub(style, width, col);
+	auto *pen = new VkPadPen(style, width, col);
+	penCatalog.insert(pen);
+	return pen;
 }
 
 void VulkanClient::clbkReleasePen(Pen *pen) const
 {
-	// STUB (Unit 1.3)
-	delete pen;
+	if (!pen || penCatalog.erase(pen) == 0)
+		return;
+	delete static_cast<VkPadPen *>(pen);
 }
 
 Brush *VulkanClient::clbkCreateBrush(DWORD col) const
 {
-	// STUB (Unit 1.3)
-	return new VkPhase0BrushStub(col);
+	auto *brush = new VkPadBrush(col);
+	brushCatalog.insert(brush);
+	return brush;
 }
 
 void VulkanClient::clbkReleaseBrush(Brush *brush) const
 {
-	// STUB (Unit 1.3)
-	delete brush;
+	if (!brush || brushCatalog.erase(brush) == 0)
+		return;
+	delete static_cast<VkPadBrush *>(brush);
 }
 
 ParticleStream *VulkanClient::clbkCreateParticleStream(PARTICLESTREAMSPEC *pss)

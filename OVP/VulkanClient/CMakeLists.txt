@@ -50,7 +50,10 @@ set(VKCLIENT_SOURCES
   VkContext.cpp
   VkSwapchain.cpp
   VkBlit.cpp
+  VkPad.cpp
   VkSurface.cpp
+  VkTextMgr.cpp
+  VkPadTools.cpp
   VideoTab.cpp
   VulkanClient.cpp
   ${vk_bootstrap_SOURCE_DIR}/src/VkBootstrap.cpp
@@ -65,7 +68,10 @@ set(VKCLIENT_HEADERS
   VkContext.h
   VkSwapchain.h
   VkBlit.h
+  VkPad.h
   VkSurface.h
+  VkTextMgr.h
+  VkPadTools.h
   VideoTab.h
   VulkanClient.h
 )
@@ -75,6 +81,10 @@ set(VKCLIENT_SHADERS
   Shaders/Blit.frag
   Shaders/BlitVertSpv.h
   Shaders/BlitFragSpv.h
+  Shaders/Sketchpad.vert
+  Shaders/Sketchpad.frag
+  Shaders/SketchpadVertSpv.h
+  Shaders/SketchpadFragSpv.h
 )
 
 set(VKCLIENT_API_HEADERS

@@ -1210,6 +1210,15 @@ bool VkSurfNative::CopyFromHBITMAP(HBITMAP hbm, int srcX, int srcY, int srcW, in
 	return UploadMipChain(bgra.data(), bgra.size(), { 0 }, { bgra.size() });
 }
 
+bool VkSurfNative::UploadBgra(const uint8_t *bgra, size_t byteSize)
+{
+	if (!bgra || IsCompressed() || format != VK_FORMAT_B8G8R8A8_UNORM)
+		return false;
+	if (byteSize != (size_t)width * height * 4u)
+		return false;
+	return UploadMipChain(bgra, byteSize, { 0 }, { byteSize });
+}
+
 bool VkSurfNative::Decompress()
 {
 	if (!IsCompressed())
@@ -1329,7 +1338,7 @@ bool VkSurfNative::ReadbackBgra(std::vector<uint8_t> &outBgra, uint32_t &outWidt
 
 VkImageView VkSurfNative::GetRenderTargetView()
 {
-	if (mipLevels <= 1)
+	if (mipLevels <= 1 && hasAlpha)
 		return imageView;
 	if (rtMip0View != VK_NULL_HANDLE)
 		return rtMip0View;
@@ -1344,7 +1353,7 @@ VkImageView VkSurfNative::GetRenderTargetView()
 	viewInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
 	viewInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
 	viewInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
-	viewInfo.components.a = hasAlpha ? VK_COMPONENT_SWIZZLE_IDENTITY : VK_COMPONENT_SWIZZLE_ONE;
+	viewInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
 	viewInfo.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
 	viewInfo.subresourceRange.baseMipLevel   = 0;
 	viewInfo.subresourceRange.levelCount     = 1;

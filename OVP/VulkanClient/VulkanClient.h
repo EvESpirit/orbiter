@@ -21,6 +21,7 @@ class VideoTab;
 class VkContext;
 class VkSwapchain;
 class VkBlitPipeline;
+class VkPadPipeline;
 class VkSurfNative;
 
 namespace oapi {
@@ -77,7 +78,6 @@ public:
 	HDC clbkGetSurfaceDC(SURFHANDLE surf) override;
 	void clbkReleaseSurfaceDC(SURFHANDLE surf, HDC hDC) override;
 
-	// STUB (Unit 1.3): Font, pen, brush, and Sketchpad placeholders
 	Sketchpad *clbkGetSketchpad(SURFHANDLE surf) override;
 	void clbkReleaseSketchpad(Sketchpad *sp) override;
 	Font *clbkCreateFont(int height, bool prop, const char *face, FontStyle style = FontStyle::FONT_NORMAL, int orientation = 0) const override;
@@ -95,6 +95,7 @@ public:
 	ParticleStream *clbkCreateReentryStream(PARTICLESTREAMSPEC *pss, OBJHANDLE hVessel) override;
 
 	bool IsValidSurface(const VkSurfNative *surf) const { return surfaceCatalog.count(const_cast<VkSurfNative *>(surf)) != 0; }
+	bool IsValidFont(const Font *font) const { return fontCatalog.count(const_cast<Font *>(font)) != 0; }
 
 protected:
 	bool clbkUseLaunchpadVideoTab() const override { return true; }
@@ -122,14 +123,20 @@ private:
 	void DestroyImGuiPlaceholderTexture();
 	void ReclaimRetiredSurfaces();
 	void DestroyAllSurfaces();
+	void DestroyAllDrawingTools();
 
 	std::unique_ptr<VideoTab> vtab;
 	std::unique_ptr<VkContext> ctx;                                  ///< Per-session Vulkan device (null outside a session)
 	std::unique_ptr<VkSwapchain> swapchain;                          ///< Per-session swapchain and scene target
 	std::unique_ptr<VkBlitPipeline> blitter;                         ///< Per-session 2D textured/color-keyed blit pipeline
+	std::unique_ptr<VkPadPipeline> skpPipeline;                      ///< Per-session 2D Sketchpad pipeline and pad pool
+	Font *defaultFont = nullptr;                                     ///< Default fixed font for Sketchpad initialization
 	std::unordered_set<VkSurfNative *> surfaceCatalog;               ///< All live VkSurfNative instances in the session
 	std::vector<RetiredSurface> retiredSurfaces;                     ///< Deferred destruction queue keeping GPU-referenced surfaces alive across in-flight frames
 	std::unordered_map<std::string, VkSurfNative *> sharedTextures;  ///< Shared/managed texture cache keyed by relative path
+	mutable std::unordered_set<Font *> fontCatalog;                  ///< All live VkPadFont instances (not tied to a session)
+	mutable std::unordered_set<Pen *> penCatalog;                    ///< All live VkPadPen instances
+	mutable std::unordered_set<Brush *> brushCatalog;                ///< All live VkPadBrush instances
 	std::vector<std::unique_ptr<ParticleStream>> stubParticleStreams; // STUB (Phase 4): Vessel exhaust stream placeholders
 	uint64_t frameCounter = 0;                                       ///< Monotonic count of acquired swapchain frames in this session
 	HWND renderWnd = nullptr;                                        ///< Active Win32 render window handle

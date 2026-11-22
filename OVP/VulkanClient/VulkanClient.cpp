@@ -15,6 +15,7 @@
 #include "VkSwapchain.h"
 #include "VkBlit.h"
 #include "VkPad.h"
+#include "VkPanel2D.h"
 #include "VkSurface.h"
 #include "VkTextMgr.h"
 #include "VkPadTools.h"
@@ -23,6 +24,7 @@
 #include "imgui_impl_vulkan.h"
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -150,9 +152,14 @@ VulkanClient::~VulkanClient()
 {
 	if (imguiInitialized)
 		clbkImGuiShutdown();
+	panel2d.reset();
 	if (skpPipeline) {
 		skpPipeline->FlushActivePads();
 		skpPipeline.reset();
+	}
+	if (defaultPanelTex) {
+		clbkReleaseSurface(defaultPanelTex);
+		defaultPanelTex = nullptr;
 	}
 	if (defaultFont) {
 		clbkReleaseFont(defaultFont);
@@ -312,6 +319,16 @@ HWND VulkanClient::clbkCreateRenderWindow()
 		skpPipeline.reset();
 		VkLogWarn("VkPadPipeline initialisation failed; 2D Sketchpad rendering is disabled");
 	}
+	if (skpPipeline) {
+		panel2d = std::make_unique<VkPanel2D>();
+		if (!panel2d->Init(*ctx, *swapchain, *skpPipeline)) {
+			panel2d.reset();
+			VkLogWarn("VkPanel2D initialisation failed; 2D panel rendering is disabled");
+		}
+	}
+	defaultPanelTex = clbkLoadTexture("Null.dds");
+	if (!defaultPanelTex)
+		VkLogWarn("clbkCreateRenderWindow: Null.dds not found; using black MFD fallback");
 	if (!defaultFont)
 		defaultFont = clbkCreateFont(20, true, "fixed");
 
@@ -446,7 +463,212 @@ void VulkanClient::UpdateViewportSize(HWND hWnd)
 void VulkanClient::clbkPostCreation()
 {
 	// STUB (Phase 2): Post-creation scene initialization
+#ifdef VKCLIENT_SKETCHPAD_TEST
+	SketchPadTest();
+#endif
 }
+
+#ifdef VKCLIENT_SKETCHPAD_TEST
+// ==============================================================
+// Unit 1.4: SketchPad parity harness (mirrors D3D9Client::SketchPadTest)
+// Part 1 is pixel-exact against D3D9Client.cpp:616-674 -> SketchpadOutput.png.
+// Part 2 exercises all Phase-1 Sketchpad features (transforms, wide miter
+// joins, dashed lines, CopyTetragon, GradientFillRect, Text) ->
+// SketchpadOutput2_Phase1.png; gcCore2 CreateTriangles/CreatePoly + DrawPoly
+// and IMAGE_DDS export wait until Phase 8 (gcCore).
+// ==============================================================
+void VulkanClient::SketchPadTest()
+{
+	VkLogAlw("[SKPTEST] Running Unit 1.4 SketchPadTest()...");
+
+	// --- Part 1: Direct mirror of D3D9Client::SketchPadTest() (lines 618-673) ---
+	SURFHANDLE hSrc = clbkLoadSurface("D3D9/SketchpadTest.dds", OAPISURFACE_TEXTURE);
+	SURFHANDLE hTgt = clbkLoadSurface("D3D9/SketchpadTest.dds", OAPISURFACE_RENDERTARGET);
+	if (!hSrc || !hTgt) {
+		VkLogErr("[SKPTEST] Failed to load D3D9/SketchpadTest.dds (hSrc=%p, hTgt=%p)", hSrc, hTgt);
+		if (hSrc) clbkReleaseSurface(hSrc);
+		if (hTgt) clbkReleaseSurface(hTgt);
+		return;
+	}
+
+	clbkSetSurfaceColourKey(hSrc, 0xFFFFFFFF);
+
+	Sketchpad *pSkp = clbkGetSketchpad(hTgt);
+	if (!pSkp) {
+		VkLogErr("[SKPTEST] clbkGetSketchpad(hTgt) returned null");
+		clbkReleaseSurface(hSrc);
+		clbkReleaseSurface(hTgt);
+		return;
+	}
+
+	RECT r = { 17, 1, 31, 15 };
+	RECT t = { 1, 33, 31, 63 };
+	RECT q = { 0, 16, 16, 32 };
+	RECT w = { 49, 1, 63, 15 };
+
+	pSkp->CopyRect(hSrc, &r, 1, 1);
+	pSkp->ColorKey(hSrc, &r, 33, 1);
+	pSkp->SetBlendState(static_cast<Sketchpad::BlendState>(Sketchpad::BlendState::ALPHABLEND | Sketchpad::BlendState::FILTER_POINT));
+	pSkp->StretchRect(hSrc, &r, &t);
+	pSkp->SetBlendState();
+	pSkp->StretchRect(hSrc, &r, &w);
+	pSkp->RotateRect(hSrc, &q, 24, 24, float(PI05));
+	pSkp->RotateRect(hSrc, &q, 40, 24, float(PI));
+	pSkp->RotateRect(hSrc, &q, 56, 24, float(-PI05));
+
+	RECT tr = { 33, 49, 47, 63 };
+	pSkp->ColorFill(0xFFFF00FF, &tr);
+
+	pSkp->QuickPen(0xFF000000);
+	pSkp->QuickBrush(0x80FFFF00);
+	pSkp->Rectangle(49, 33, 63, 47); // 1px margin
+	pSkp->Ellipse(49, 49, 63, 63);   // 1px margin
+
+	// No Pen, Brush Only
+	pSkp->SetPen(nullptr);
+	pSkp->QuickBrush(0xFF00FF00);
+	pSkp->Rectangle(65, 33, 79, 47); // 1px tlm 1px brm
+	pSkp->Ellipse(65, 49, 79, 63);   // 1px tlm 1px brm
+
+	pSkp->QuickPen(0xFFFFFFFF);
+	pSkp->MoveTo(65, 1);
+	pSkp->LineTo(65, 14);
+	pSkp->LineTo(78, 14);
+	pSkp->LineTo(78, 1);
+	pSkp->LineTo(65, 1);
+
+	RECT cr = { 33, 33, 47, 47 };
+	pSkp->ClipRect(&cr);
+	pSkp->ColorFill(0xFFFFFF00, nullptr);
+	pSkp->ClipRect();
+
+	clbkReleaseSketchpad(pSkp);
+
+	const bool savedPart1 = clbkSaveSurfaceToImage(hTgt, "SketchpadOutput", IMAGE_PNG);
+	VkLogAlw("[SKPTEST] Part 1 SketchpadOutput.png saved=%d", savedPart1 ? 1 : 0);
+
+	clbkReleaseSurface(hSrc);
+	clbkReleaseSurface(hTgt);
+
+	// --- Part 2 (Phase-1 subset): transforms, wide miter pens, CopyTetragon, gradients, text ---
+	SURFHANDLE hTgt2 = clbkCreateSurfaceEx(768, 512, OAPISURFACE_RENDERTARGET | OAPISURFACE_TEXTURE);
+	if (!hTgt2) {
+		VkLogErr("[SKPTEST] Failed to create 768x512 target for Part 2");
+		return;
+	}
+
+	pSkp = clbkGetSketchpad(hTgt2);
+	if (!pSkp) {
+		clbkReleaseSurface(hTgt2);
+		return;
+	}
+
+	pSkp->ColorFill(0xFFFFFFFF, nullptr);
+
+	IVECTOR2 hex[6]{};
+	IVECTOR2 hexHalf[6]{};
+	for (int i = 0; i < 6; ++i) {
+		const double a = (PI2 / 6.0) * double(i);
+		hex[i].x = int(std::lround(std::cos(a) * 100.0));
+		hex[i].y = int(std::lround(std::sin(a) * 100.0));
+		hexHalf[i].x = int(std::lround(std::cos(a) * 50.0));
+		hexHalf[i].y = int(std::lround(std::sin(a) * 50.0));
+	}
+
+	const IVECTOR2 pos0 = { 128, 128 };
+	const IVECTOR2 pos1 = { 128, 384 };
+	const IVECTOR2 pos2 = { 384, 128 };
+	const IVECTOR2 pos3 = { 640, 128 };
+	const IVECTOR2 pos4 = { 384, 384 };
+	const IVECTOR2 pos5 = { 640, 384 };
+	const FVECTOR2 scaleOne = { 1.0f, 1.0f };
+	const FVECTOR2 scaleTwo = { 2.0f, 2.0f };
+
+	pSkp->PushWorldTransform();
+
+	// Scaled filled hexagon + 3px black outline (pos0)
+	pSkp->QuickBrush(0xA0000088);
+	pSkp->QuickPen(0xA0000000, 3.0f);
+	pSkp->SetWorldScaleTransform2D(&scaleTwo, &pos0);
+	pSkp->Polygon(hexHalf, 6);
+
+	// Open 5-segment polyline + dashed rectangle (pos1)
+	pSkp->SetWorldScaleTransform2D(&scaleOne, &pos1);
+	pSkp->SetBrush(nullptr);
+	pSkp->QuickPen(0xFFCC2200, 4.0f);
+	pSkp->Polyline(hex, 6);
+
+	// Dashed pen + GradientFillRect (pos2)
+	pSkp->SetWorldScaleTransform2D(&scaleOne, &pos2);
+	RECT gradR = { -90, -70, 90, 70 };
+	pSkp->GradientFillRect(&gradR, 0xFFFF8800, 0xFF2244AA, true);
+	pSkp->QuickPen(0xFF000000, 3.0f, 2);
+	pSkp->SetBrush(nullptr);
+	pSkp->Rectangle(-90, -70, 90, 70);
+
+	// Text alignment + rotated text (pos3)
+	pSkp->SetWorldScaleTransform2D(&scaleOne, &pos3);
+	Font *testFont = clbkCreateFont(22, true, "Sans");
+	Font *rotFont = clbkCreateFont(18, false, "Fixed", FontStyle::FONT_NORMAL, 300);
+	pSkp->SetFont(testFont);
+	pSkp->SetTextColor(0xFF000000);
+	pSkp->SetTextAlign(Sketchpad::CENTER, Sketchpad::BASELINE);
+	pSkp->Text(0, -20, "VkPad 1.4 Parity", 16);
+	pSkp->SetFont(rotFont);
+	pSkp->Text(0, 35, "30deg Mono Test", 15);
+	pSkp->SetFont(nullptr);
+
+	// Wide 25px pen miter-joined closed hexagon (pos4, mirrors D3D9Client.cpp:781-783)
+	pSkp->SetWorldScaleTransform2D(&scaleOne, &pos4);
+	pSkp->SetBrush(nullptr);
+	pSkp->QuickPen(0xFF000000, 25.0f);
+	pSkp->Polygon(hex, 6);
+
+	// CopyTetragon with generic/noisep.dds (pos5, mirrors D3D9Client.cpp:785-795)
+	SURFHANDLE hNoise = clbkLoadSurface("generic/noisep.dds", OAPISURFACE_TEXTURE);
+	if (hNoise) {
+		pSkp->SetWorldScaleTransform2D(&scaleOne, &pos5);
+		FVECTOR2 pt[4];
+		pt[0] = FVECTOR2(-100.0f, -100.0f);
+		pt[1] = FVECTOR2(-100.0f, 50.0f);
+		pt[2] = FVECTOR2(100.0f, 100.0f);
+		pt[3] = FVECTOR2(100.0f, -50.0f);
+		pSkp->CopyTetragon(hNoise, nullptr, pt);
+	}
+
+	pSkp->PopWorldTransform();
+
+	// Explicit valid ColorKey tests (Part 1 uses 0xFFFFFFFF == SURF_NO_CK)
+	SURFHANDLE hSrcCk = clbkLoadSurface("D3D9/SketchpadTest.dds", OAPISURFACE_TEXTURE);
+	if (hSrcCk) {
+		RECT ckR = { 17, 1, 31, 15 };
+		RECT ckBg1 = { 15, 7, 31, 23 };
+		RECT ckBg2 = { 39, 7, 55, 23 };
+		pSkp->ColorFill(0xFFFF00FF, &ckBg1);
+		clbkSetSurfaceColourKey(hSrcCk, 0xFF000000);
+		pSkp->ColorKey(hSrcCk, &ckR, 16, 8);
+
+		pSkp->ColorFill(0xFFFFFF00, &ckBg2);
+		clbkSetSurfaceColourKey(hSrcCk, 0x00FFFFFF);
+		pSkp->ColorKey(hSrcCk, &ckR, 40, 8);
+
+		clbkSetSurfaceColourKey(hSrcCk, SURF_NO_CK);
+	}
+
+	clbkReleaseSketchpad(pSkp);
+	clbkReleaseFont(testFont);
+	clbkReleaseFont(rotFont);
+	if (hSrcCk)
+		clbkReleaseSurface(hSrcCk);
+	if (hNoise)
+		clbkReleaseSurface(hNoise);
+
+	const bool savedPart2 = clbkSaveSurfaceToImage(hTgt2, "SketchpadOutput2_Phase1", IMAGE_PNG);
+	VkLogAlw("[SKPTEST] Part 2 SketchpadOutput2_Phase1.png saved=%d", savedPart2 ? 1 : 0);
+
+	clbkReleaseSurface(hTgt2);
+}
+#endif
 
 void VulkanClient::clbkCloseSession(bool fastclose)
 {
@@ -514,9 +736,14 @@ void VulkanClient::clbkDestroyRenderWindow(bool fastclose)
 	VkLogAlw("================ clbkDestroyRenderWindow ================");
 	if (imguiInitialized)
 		clbkImGuiShutdown();
+	panel2d.reset();
 	if (skpPipeline) {
 		skpPipeline->FlushActivePads();
 		skpPipeline.reset();
+	}
+	if (defaultPanelTex) {
+		clbkReleaseSurface(defaultPanelTex);
+		defaultPanelTex = nullptr;
 	}
 	if (defaultFont) {
 		clbkReleaseFont(defaultFont);
@@ -1060,6 +1287,9 @@ bool VulkanClient::clbkSaveSurfaceToImage(SURFHANDLE surf, const char *fname, Im
 {
 	if (!swapchain)
 		return false;
+	// Core WriteImageDataToFile only indexes [".bmp", ".png", ".jpg", ".tif"].
+	if (fname && (int(fmt) < int(IMAGE_BMP) || int(fmt) > int(IMAGE_TIF)))
+		return false;
 
 	std::vector<uint8_t> bgra;
 	uint32_t w = 0, h = 0;
@@ -1464,6 +1694,21 @@ void VulkanClient::clbkReleaseSurfaceDC(SURFHANDLE surf, HDC hDC)
 	if (surfaceCatalog.count(s) == 0)
 		return;
 	s->ReleaseDC(hDC);
+}
+
+// ==============================================================
+// 2D Panel, Glass Cockpit & HUD Mesh Rendering (Unit 1.3c)
+// ==============================================================
+
+void VulkanClient::clbkRender2DPanel(SURFHANDLE *hSurf, MESHHANDLE hMesh, MATRIX3 *T, bool additive)
+{
+	clbkRender2DPanel(hSurf, hMesh, T, 1.0f, additive);
+}
+
+void VulkanClient::clbkRender2DPanel(SURFHANDLE *hSurf, MESHHANDLE hMesh, MATRIX3 *T, float alpha, bool additive)
+{
+	if (panel2d)
+		panel2d->Render(*this, hSurf, hMesh, T, alpha, additive, defaultPanelTex);
 }
 
 // ==============================================================

@@ -322,6 +322,7 @@ void VkPadPipeline::Destroy()
 			}
 		};
 		destroyImage(whiteImage, whiteAlloc, whiteView);
+		destroyImage(blackImage, blackAlloc, blackView);
 		destroyImage(noiseImage, noiseAlloc, noiseView);
 
 		auto destroySampler = [&](VkSampler &samp) {
@@ -431,6 +432,10 @@ bool VkPadPipeline::CreateHelperTextures()
 {
 	const uint8_t white[4] = { 255, 255, 255, 255 };
 	if (!CreateStaticTexture(1, 1, white, whiteImage, whiteAlloc, whiteView))
+		return false;
+
+	const uint8_t black[4] = { 0, 0, 0, 255 };
+	if (!CreateStaticTexture(1, 1, black, blackImage, blackAlloc, blackView))
 		return false;
 
 	constexpr uint32_t kNoiseDim = 128;
@@ -842,8 +847,9 @@ VkDescriptorPool VkPadPipeline::CreateDescriptorPool()
 	return pool;
 }
 
-VkDescriptorSet VkPadPipeline::AllocateDescriptorSet(uint32_t slot)
+VkDescriptorSet VkPadPipeline::AllocateDescriptorSet(uint32_t slot, VkDescriptorSetLayout customSetLayout)
 {
+	const VkDescriptorSetLayout layoutToUse = (customSetLayout != VK_NULL_HANDLE) ? customSetLayout : setLayout;
 	SlotPools &sp = slotPools[slot % kNumSlots];
 	while (true) {
 		if (sp.activeDescPool >= sp.descPools.size()) {
@@ -857,7 +863,7 @@ VkDescriptorSet VkPadPipeline::AllocateDescriptorSet(uint32_t slot)
 		ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
 		ai.descriptorPool     = sp.descPools[sp.activeDescPool];
 		ai.descriptorSetCount = 1;
-		ai.pSetLayouts        = &setLayout;
+		ai.pSetLayouts        = &layoutToUse;
 
 		VkDescriptorSet set = VK_NULL_HANDLE;
 		const VkResult vr = vkAllocateDescriptorSets(ctx->Device(), &ai, &set);
@@ -1369,7 +1375,6 @@ void VkPad::AppendTexturedQuad(
 	const FVECTOR2 pos[4],
 	const FVECTOR2 uv[4],
 	bool useColorKey,
-	bool forceColorKey,
 	const FMATRIX4 *overrideWorld)
 {
 	if (!src || !client.IsValidSurface(src))
@@ -1377,12 +1382,10 @@ void VkPad::AppendTexturedQuad(
 	if (src->IsCompressed() && !src->Decompress())
 		return;
 
-	const bool applyKey = forceColorKey || (useColorKey && src->IsColorKeyEnabled());
+	const bool applyKey = useColorKey && src->IsColorKeyEnabled();
 	const int32_t flags = VK_SKPF_TEX | (applyKey ? VK_SKPF_KEY : 0);
 	const uint32_t sw = VK_SKPSW_CENTER | VK_SKPSW_TEXTURE | (applyKey ? VK_SKPSW_COLORKEY : 0u);
-	const uint32_t keyAbgr = (applyKey && src->IsColorKeyEnabled())
-		? ForceOpaqueIfZeroAlpha(src->GetColorKey())
-		: 0xFF000000u;
+	const uint32_t keyAbgr = applyKey ? ForceOpaqueIfZeroAlpha(src->GetColorKey()) : 0u;
 
 	DrawBatch &batch = BeginBatch(false, flags, src, nullptr, keyAbgr, 1.0f, overrideWorld);
 	const uint32_t base = uint32_t(vertices.size());
@@ -1430,10 +1433,27 @@ void VkPad::AppendHairlineSegments(const FVECTOR2 *pts, int npt, bool closed, bo
 	for (int s = 0; s < segCount; ++s) {
 		const FVECTOR2 &a = pts[s * step];
 		const FVECTOR2 &b = separatePairs ? pts[s * 2 + 1] : pts[(s + 1) % npt];
-		const float ax = a.x + 0.5f;
-		const float ay = a.y + 0.5f;
-		const float bx = b.x + 0.5f;
-		const float by = b.y + 0.5f;
+		float ax = a.x + 0.5f;
+		float ay = a.y + 0.5f;
+		float bx = b.x + 0.5f;
+		float by = b.y + 0.5f;
+
+		// Vulkan LINE_LIST drops max-coordinate endpoints on axis-aligned segments
+		// regardless of draw direction. Orient non-dashed axis-aligned segments
+		// along +X/+Y and extend past the far pixel boundary for [min..max] parity.
+		if (!dashed) {
+			const float dx = bx - ax;
+			const float dy = by - ay;
+			if (std::fabs(dx) < 1e-4f && std::fabs(dy) >= 1e-4f) {
+				if (ay > by)
+					std::swap(ay, by);
+				by += 0.55f;
+			} else if (std::fabs(dy) < 1e-4f && std::fabs(dx) >= 1e-4f) {
+				if (ax > bx)
+					std::swap(ax, bx);
+				bx += 0.55f;
+			}
+		}
 
 		const uint32_t base = uint32_t(vertices.size());
 		vertices.push_back({ ax, ay, 0.0f, 0.0f, 0.0f, ax, ay, clr, sw0 });
@@ -1623,8 +1643,8 @@ bool VkPad::PrintCp1252Run(float x, float y, const char *cp1252, int len, float 
 	}
 
 	float totalRot = angle;
-	if (cfont->Rotation() != 0)
-		totalRot += float(cfont->Rotation()) * (kPi / 1800.0f);
+	if (cfont->Rotation() != 0.0f)
+		totalRot += cfont->Rotation() * (kPi / 180.0f);
 
 	const bool rotated = (std::fabs(totalRot) > 1e-5f);
 	FMATRIX4 rotWorld = MatIdentity();
@@ -1756,6 +1776,9 @@ void VkPad::Line(int x0, int y0, int x1, int y1)
 
 void VkPad::Rectangle(int x0, int y0, int x1, int y1)
 {
+	if (x1 == x0 || y1 == y0)
+		return;
+
 	const float l = float(std::min(x0, x1) + origin.x);
 	const float t = float(std::min(y0, y1) + origin.y);
 	const float r = float(std::max(x0, x1) + origin.x);
@@ -1765,38 +1788,60 @@ void VkPad::Rectangle(int x0, int y0, int x1, int y1)
 		AppendSolidQuad(l, t, r, b, ActiveBrushColor());
 
 	if (HasActivePen()) {
-		const FVECTOR2 pts[4] = { { l, t }, { r, t }, { r, b }, { l, b } };
+		// Keep 1px outline inside the half-open [l, r) x [t, b) box (matching D3D9/GDI).
+		const float sr = std::max(l, r - 1.0f);
+		const float sb = std::max(t, b - 1.0f);
+		const FVECTOR2 pts[4] = { { l, t }, { sr, t }, { sr, sb }, { l, sb } };
 		AppendStrokePolyline(pts, 4, true);
 	}
 }
 
 void VkPad::Ellipse(int x0, int y0, int x1, int y1)
 {
-	const float cx = 0.5f * float(x0 + x1) + float(origin.x);
-	const float cy = 0.5f * float(y0 + y1) + float(origin.y);
-	const float rx = 0.5f * std::fabs(float(x1 - x0));
-	const float ry = 0.5f * std::fabs(float(y1 - y0));
+	if (x1 == x0 || y1 == y0)
+		return;
+
+	const float l = float(std::min(x0, x1) + origin.x);
+	const float t = float(std::min(y0, y1) + origin.y);
+	const float r = float(std::max(x0, x1) + origin.x);
+	const float b = float(std::max(y0, y1) + origin.y);
+
+	const bool hasPen = HasActivePen();
+	const bool hasBrush = HasActiveBrush();
+	if (!hasPen && !hasBrush)
+		return;
+
+	// Inset outline bounds by 1px on bottom-right so the pen stays inside [l, r) x [t, b).
+	const float sr = hasPen ? std::max(l, r - 1.0f) : r;
+	const float sb = hasPen ? std::max(t, b - 1.0f) : b;
+	const float cx = 0.5f * (l + sr);
+	const float cy = 0.5f * (t + sb);
+	const float rx = 0.5f * (sr - l);
+	const float ry = 0.5f * (sb - t);
 	if (rx <= 0.0f && ry <= 0.0f)
 		return;
 
 	const float maxR = std::max(rx, ry);
-	const int segs = std::clamp(int(maxR * 0.8f), 16, 128);
+	const int segs = ((std::clamp(int(maxR * 2.5f), 20, 128) + 3) & ~3);
 
 	std::vector<FVECTOR2> ring(static_cast<size_t>(segs));
 	for (int i = 0; i < segs; ++i) {
-		const float a = (2.0f * kPi * float(i)) / float(segs);
+		// Half-step phase places flat axis-aligned edges across all 4 cardinal poles.
+		const float a = (2.0f * kPi * (float(i) + 0.5f)) / float(segs);
 		ring[size_t(i)] = { cx + std::cos(a) * rx, cy + std::sin(a) * ry };
 	}
 
-	if (HasActiveBrush()) {
+	if (hasBrush) {
 		DrawBatch &batch = BeginBatch(false, 0, nullptr, nullptr, 0, 1.0f);
 		const uint32_t clr = ActiveBrushColor();
 		const uint32_t sw = VK_SKPSW_CENTER | VK_SKPSW_FRAGMENT;
 		const uint32_t base = uint32_t(vertices.size());
 
-		vertices.push_back({ cx, cy, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, clr, sw });
+		// Align fill vertices to the pen centerline (+0.5px) when stroked so fill never bleeds out.
+		const float fShift = hasPen ? 0.5f : 0.0f;
+		vertices.push_back({ cx + fShift, cy + fShift, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, clr, sw });
 		for (int i = 0; i < segs; ++i)
-			vertices.push_back({ ring[size_t(i)].x, ring[size_t(i)].y, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, clr, sw });
+			vertices.push_back({ ring[size_t(i)].x + fShift, ring[size_t(i)].y + fShift, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, clr, sw });
 
 		for (int i = 0; i < segs; ++i) {
 			indices.push_back(base);
@@ -1806,7 +1851,7 @@ void VkPad::Ellipse(int x0, int y0, int x1, int y1)
 		}
 	}
 
-	if (HasActivePen())
+	if (hasPen)
 		AppendStrokePolyline(ring.data(), segs, true);
 }
 
@@ -2040,7 +2085,7 @@ void VkPad::CopyRect(const SURFHANDLE pSrc, const LPRECT s, int tx, int ty)
 		{ float(srcR.right), float(srcR.bottom) },
 		{ float(srcR.left),  float(srcR.bottom) }
 	};
-	AppendTexturedQuad(src, pos, uv, src->IsColorKeyEnabled(), false);
+	AppendTexturedQuad(src, pos, uv, src->IsColorKeyEnabled());
 }
 
 void VkPad::StretchRect(const SURFHANDLE pSrc, const LPRECT s, const LPRECT t)
@@ -2074,7 +2119,7 @@ void VkPad::StretchRect(const SURFHANDLE pSrc, const LPRECT s, const LPRECT t)
 		{ float(srcR.right), float(srcR.bottom) },
 		{ float(srcR.left),  float(srcR.bottom) }
 	};
-	AppendTexturedQuad(src, pos, uv, src->IsColorKeyEnabled(), false);
+	AppendTexturedQuad(src, pos, uv, src->IsColorKeyEnabled());
 }
 
 void VkPad::RotateRect(const SURFHANDLE pSrc, const LPRECT s, int cx, int cy, float angle, float sw, float sh)
@@ -2110,7 +2155,7 @@ void VkPad::RotateRect(const SURFHANDLE pSrc, const LPRECT s, int cx, int cy, fl
 		{ float(srcR.right), float(srcR.bottom) },
 		{ float(srcR.left),  float(srcR.bottom) }
 	};
-	AppendTexturedQuad(src, pos, uv, src->IsColorKeyEnabled(), false);
+	AppendTexturedQuad(src, pos, uv, src->IsColorKeyEnabled());
 }
 
 void VkPad::ColorKey(const SURFHANDLE pSrc, const LPRECT s, int tx, int ty)
@@ -2136,7 +2181,7 @@ void VkPad::ColorKey(const SURFHANDLE pSrc, const LPRECT s, int tx, int ty)
 		{ float(srcR.right), float(srcR.bottom) },
 		{ float(srcR.left),  float(srcR.bottom) }
 	};
-	AppendTexturedQuad(src, pos, uv, true, true);
+	AppendTexturedQuad(src, pos, uv, true);
 }
 
 void VkPad::ColorFill(DWORD color, const LPRECT t)
@@ -2173,7 +2218,7 @@ void VkPad::CopyTetragon(const SURFHANDLE pSrc, const LPRECT _s, const FVECTOR2 
 		{ float(srcR.right), float(srcR.bottom) },
 		{ float(srcR.left),  float(srcR.bottom) }
 	};
-	AppendTexturedQuad(src, pt, uv, src->IsColorKeyEnabled(), false);
+	AppendTexturedQuad(src, pt, uv, src->IsColorKeyEnabled());
 }
 
 void VkPad::FillTetragon(DWORD color, const FVECTOR2 pt[4])
@@ -2269,7 +2314,7 @@ void VkPad::StretchRegion(const skpRegion *rgn, const SURFHANDLE hSrc, const LPR
 				{ float(sx[col + 1]), float(sy[row + 1]) },
 				{ float(sx[col]),     float(sy[row + 1]) }
 			};
-			AppendTexturedQuad(src, pos, uv, src->IsColorKeyEnabled(), false);
+			AppendTexturedQuad(src, pos, uv, src->IsColorKeyEnabled());
 		}
 	}
 }

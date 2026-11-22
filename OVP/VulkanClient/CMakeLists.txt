@@ -51,6 +51,7 @@ set(VKCLIENT_SOURCES
   VkSwapchain.cpp
   VkBlit.cpp
   VkPad.cpp
+  VkPanel2D.cpp
   VkSurface.cpp
   VkTextMgr.cpp
   VkPadTools.cpp
@@ -69,6 +70,7 @@ set(VKCLIENT_HEADERS
   VkSwapchain.h
   VkBlit.h
   VkPad.h
+  VkPanel2D.h
   VkSurface.h
   VkTextMgr.h
   VkPadTools.h
@@ -85,6 +87,10 @@ set(VKCLIENT_SHADERS
   Shaders/Sketchpad.frag
   Shaders/SketchpadVertSpv.h
   Shaders/SketchpadFragSpv.h
+  Shaders/Panel2D.vert
+  Shaders/Panel2D.frag
+  Shaders/Panel2DVertSpv.h
+  Shaders/Panel2DFragSpv.h
 )
 
 set(VKCLIENT_API_HEADERS

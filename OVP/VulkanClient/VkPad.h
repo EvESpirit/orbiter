@@ -116,7 +116,7 @@ public:
 		bool depthEnable);
 
 	VkPipelineLayout PipelineLayout() const { return pipeLayout; }
-	VkDescriptorSet AllocateDescriptorSet(uint32_t slot);
+	VkDescriptorSet AllocateDescriptorSet(uint32_t slot, VkDescriptorSetLayout customSetLayout = VK_NULL_HANDLE);
 	void BeginSlotFrame(uint32_t slot, uint64_t slotGen);
 
 	struct BufferSlice {
@@ -130,6 +130,7 @@ public:
 	BufferSlice AllocUniform(uint32_t slot, VkDeviceSize byteSize);
 
 	VkImageView WhiteView() const { return whiteView; }
+	VkImageView BlackView() const { return blackView; }
 	VkImageView NoiseView() const { return noiseView; }
 	VkSampler NoiseSampler() const { return samplerNoise; }
 	VkSampler SamplerForFilter(FilterMode mode) const;
@@ -228,6 +229,10 @@ private:
 	VkImage       whiteImage = VK_NULL_HANDLE;
 	VmaAllocation whiteAlloc = VK_NULL_HANDLE;
 	VkImageView   whiteView  = VK_NULL_HANDLE;
+
+	VkImage       blackImage = VK_NULL_HANDLE;
+	VmaAllocation blackAlloc = VK_NULL_HANDLE;
+	VkImageView   blackView  = VK_NULL_HANDLE;
 
 	VkImage       noiseImage = VK_NULL_HANDLE;
 	VmaAllocation noiseAlloc = VK_NULL_HANDLE;
@@ -385,7 +390,6 @@ private:
 		const oapi::FVECTOR2 pos[4],
 		const oapi::FVECTOR2 uv[4],
 		bool useColorKey,
-		bool forceColorKey = false,
 		const oapi::FMATRIX4 *overrideWorld = nullptr);
 	void AppendStrokePolyline(const oapi::FVECTOR2 *pts, int npt, bool closed);
 	void AppendHairlineSegments(const oapi::FVECTOR2 *pts, int npt, bool closed, bool separatePairs = false);

@@ -22,6 +22,7 @@ class VkContext;
 class VkSwapchain;
 class VkBlitPipeline;
 class VkPadPipeline;
+class VkPanel2D;
 class VkSurfNative;
 
 namespace oapi {
@@ -87,6 +88,8 @@ public:
 	void clbkReleasePen(Pen *pen) const override;
 	Brush *clbkCreateBrush(DWORD col) const override;
 	void clbkReleaseBrush(Brush *brush) const override;
+	void clbkRender2DPanel(SURFHANDLE *hSurf, MESHHANDLE hMesh, MATRIX3 *T, bool additive = false) override;
+	void clbkRender2DPanel(SURFHANDLE *hSurf, MESHHANDLE hMesh, MATRIX3 *T, float alpha, bool additive = false) override;
 
 	// STUB (Phase 4): Particle and exhaust stream placeholders
 	ParticleStream *clbkCreateParticleStream(PARTICLESTREAMSPEC *pss) override;
@@ -124,12 +127,17 @@ private:
 	void ReclaimRetiredSurfaces();
 	void DestroyAllSurfaces();
 	void DestroyAllDrawingTools();
+#ifdef VKCLIENT_SKETCHPAD_TEST
+	void SketchPadTest();
+#endif
 
 	std::unique_ptr<VideoTab> vtab;
 	std::unique_ptr<VkContext> ctx;                                  ///< Per-session Vulkan device (null outside a session)
 	std::unique_ptr<VkSwapchain> swapchain;                          ///< Per-session swapchain and scene target
 	std::unique_ptr<VkBlitPipeline> blitter;                         ///< Per-session 2D textured/color-keyed blit pipeline
 	std::unique_ptr<VkPadPipeline> skpPipeline;                      ///< Per-session 2D Sketchpad pipeline and pad pool
+	std::unique_ptr<VkPanel2D> panel2d;                              ///< Per-session 2D panel, MFD & HUD mesh renderer
+	SURFHANDLE defaultPanelTex = nullptr;                            ///< Null.dds fallback texture for inactive MFD slots
 	Font *defaultFont = nullptr;                                     ///< Default fixed font for Sketchpad initialization
 	std::unordered_set<VkSurfNative *> surfaceCatalog;               ///< All live VkSurfNative instances in the session
 	std::vector<RetiredSurface> retiredSurfaces;                     ///< Deferred destruction queue keeping GPU-referenced surfaces alive across in-flight frames

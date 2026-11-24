@@ -24,6 +24,22 @@ const char *PresentModeName(VkPresentModeKHR mode)
 	}
 }
 
+VkFormat SelectSceneDepthFormat(VkPhysicalDevice physDev)
+{
+	const VkFormat candidates[] = {
+		VK_FORMAT_D24_UNORM_S8_UINT,
+		VK_FORMAT_D32_SFLOAT_S8_UINT,
+		VK_FORMAT_D32_SFLOAT
+	};
+	for (VkFormat fmt : candidates) {
+		VkFormatProperties props{};
+		vkGetPhysicalDeviceFormatProperties(physDev, fmt, &props);
+		if (props.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)
+			return fmt;
+	}
+	return VK_FORMAT_D32_SFLOAT;
+}
+
 void RecordImageBarrier(
 	VkCommandBuffer cmd,
 	VkImage image,
@@ -32,7 +48,8 @@ void RecordImageBarrier(
 	VkPipelineStageFlags2 srcStage,
 	VkAccessFlags2 srcAccess,
 	VkPipelineStageFlags2 dstStage,
-	VkAccessFlags2 dstAccess)
+	VkAccessFlags2 dstAccess,
+	VkImageAspectFlags aspectMask = VK_IMAGE_ASPECT_COLOR_BIT)
 {
 	VkImageMemoryBarrier2 barrier{};
 	barrier.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -45,7 +62,7 @@ void RecordImageBarrier(
 	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.image               = image;
-	barrier.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+	barrier.subresourceRange.aspectMask     = aspectMask;
 	barrier.subresourceRange.baseMipLevel   = 0;
 	barrier.subresourceRange.levelCount     = 1;
 	barrier.subresourceRange.baseArrayLayer = 0;
@@ -251,8 +268,53 @@ bool VkSwapchain::CreateSceneTarget(uint32_t width, uint32_t height)
 		return false;
 	}
 
+	depthFormat = SelectSceneDepthFormat(ctx->PhysicalDevice());
+
+	VkImageCreateInfo dci{};
+	dci.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	dci.imageType     = VK_IMAGE_TYPE_2D;
+	dci.format        = depthFormat;
+	dci.extent        = { width, height, 1 };
+	dci.mipLevels     = 1;
+	dci.arrayLayers   = 1;
+	dci.samples       = VK_SAMPLE_COUNT_1_BIT;
+	dci.tiling        = VK_IMAGE_TILING_OPTIMAL;
+	dci.usage         = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+	dci.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
+	dci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+	res = vmaCreateImage(ctx->Allocator(), &dci, &aci, &depthImage, &depthAlloc, nullptr);
+	if (res != VK_SUCCESS) {
+		VkLogErr("vmaCreateImage (sceneDepth %ux%u) failed (VkResult=%d)", width, height, (int)res);
+		depthImage = VK_NULL_HANDLE;
+		depthAlloc = VK_NULL_HANDLE;
+		DestroySceneTarget();
+		return false;
+	}
+
+	VkImageViewCreateInfo divci{};
+	divci.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	divci.image    = depthImage;
+	divci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	divci.format   = depthFormat;
+	divci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+	if (DepthHasStencil())
+		divci.subresourceRange.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+	divci.subresourceRange.baseMipLevel   = 0;
+	divci.subresourceRange.levelCount     = 1;
+	divci.subresourceRange.baseArrayLayer = 0;
+	divci.subresourceRange.layerCount     = 1;
+
+	res = vkCreateImageView(ctx->Device(), &divci, nullptr, &depthView);
+	if (res != VK_SUCCESS) {
+		VkLogErr("vkCreateImageView (sceneDepth) failed (VkResult=%d)", (int)res);
+		DestroySceneTarget();
+		return false;
+	}
+
 	sceneExtent = { width, height };
 	sceneLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	depthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 	return true;
 }
 
@@ -260,6 +322,17 @@ void VkSwapchain::DestroySceneTarget()
 {
 	if (!ctx || ctx->Device() == VK_NULL_HANDLE)
 		return;
+
+	if (depthView != VK_NULL_HANDLE) {
+		vkDestroyImageView(ctx->Device(), depthView, nullptr);
+		depthView = VK_NULL_HANDLE;
+	}
+	if (depthImage != VK_NULL_HANDLE && ctx->Allocator() != VK_NULL_HANDLE) {
+		vmaDestroyImage(ctx->Allocator(), depthImage, depthAlloc);
+		depthImage = VK_NULL_HANDLE;
+		depthAlloc = VK_NULL_HANDLE;
+	}
+	depthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
 	if (sceneView != VK_NULL_HANDLE) {
 		vkDestroyImageView(ctx->Device(), sceneView, nullptr);
@@ -411,6 +484,42 @@ void VkSwapchain::TransitionSceneLayout(
 	RecordImageBarrier(cmd, sceneImage, sceneLayout, newLayout,
 		srcStage, srcAccess, dstStage, dstAccess);
 	sceneLayout = newLayout;
+}
+
+void VkSwapchain::TransitionDepthLayout(
+	VkCommandBuffer cmd,
+	VkImageLayout newLayout,
+	VkPipelineStageFlags2 srcStage,
+	VkAccessFlags2 srcAccess,
+	VkPipelineStageFlags2 dstStage,
+	VkAccessFlags2 dstAccess)
+{
+	if (depthImage == VK_NULL_HANDLE)
+		return;
+
+	if (depthLayout == newLayout) {
+		VkMemoryBarrier2 mb{};
+		mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+		mb.srcStageMask  = srcStage;
+		mb.srcAccessMask = srcAccess;
+		mb.dstStageMask  = dstStage;
+		mb.dstAccessMask = dstAccess;
+
+		VkDependencyInfo dep{};
+		dep.sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+		dep.memoryBarrierCount = 1;
+		dep.pMemoryBarriers    = &mb;
+		vkCmdPipelineBarrier2(cmd, &dep);
+		return;
+	}
+
+	VkImageAspectFlags aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
+	if (DepthHasStencil())
+		aspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
+
+	RecordImageBarrier(cmd, depthImage, depthLayout, newLayout,
+		srcStage, srcAccess, dstStage, dstAccess, aspect);
+	depthLayout = newLayout;
 }
 
 VkCommandBuffer VkSwapchain::OffscreenCommandBuffer()
@@ -794,6 +903,102 @@ bool VkSwapchain::FillScene(const RECT *rect, DWORD col)
 
 	vkCmdEndRendering(cmd);
 	return true;
+}
+
+bool VkSwapchain::BeginScenePass(
+	bool clearColor,
+	const VkClearColorValue &clearColorVal,
+	bool clearDepth,
+	float depthClearVal,
+	bool withDepthAttachment,
+	bool clearStencil,
+	uint32_t stencilClearVal)
+{
+	if (!frameRecording || sceneView == VK_NULL_HANDLE)
+		return false;
+	if (withDepthAttachment && depthView == VK_NULL_HANDLE)
+		return false;
+
+	VkCommandBuffer cmd = frames[currentFrame].cmd;
+	const bool colorFirstTouch = (sceneLayout == VK_IMAGE_LAYOUT_UNDEFINED);
+	TransitionSceneLayout(
+		cmd,
+		VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		colorFirstTouch ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+		colorFirstTouch ? 0 : (VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT),
+		VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+		VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+	if (withDepthAttachment) {
+		const bool depthFirstTouch = (depthLayout == VK_IMAGE_LAYOUT_UNDEFINED);
+		TransitionDepthLayout(
+			cmd,
+			VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+			depthFirstTouch
+				? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT
+				: (VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT),
+			depthFirstTouch
+				? 0
+				: (VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT),
+			VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+			VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+	}
+
+	VkRenderingAttachmentInfo colorAtt{};
+	colorAtt.sType            = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+	colorAtt.imageView        = sceneView;
+	colorAtt.imageLayout      = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	colorAtt.loadOp           = clearColor ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+	colorAtt.storeOp          = VK_ATTACHMENT_STORE_OP_STORE;
+	colorAtt.clearValue.color = clearColorVal;
+
+	VkRenderingAttachmentInfo depthAtt{};
+	VkRenderingAttachmentInfo stencilAtt{};
+	if (withDepthAttachment) {
+		depthAtt.sType                         = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+		depthAtt.imageView                     = depthView;
+		depthAtt.imageLayout                   = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+		depthAtt.loadOp                        = clearDepth ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+		depthAtt.storeOp                       = VK_ATTACHMENT_STORE_OP_STORE;
+		depthAtt.clearValue.depthStencil.depth = depthClearVal;
+		depthAtt.clearValue.depthStencil.stencil = stencilClearVal;
+
+		if (DepthHasStencil()) {
+			stencilAtt             = depthAtt;
+			stencilAtt.loadOp      = (clearStencil || clearDepth) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+		}
+	}
+
+	VkRenderingInfo ri{};
+	ri.sType                = VK_STRUCTURE_TYPE_RENDERING_INFO;
+	ri.renderArea.offset    = { 0, 0 };
+	ri.renderArea.extent    = sceneExtent;
+	ri.layerCount           = 1;
+	ri.colorAttachmentCount = 1;
+	ri.pColorAttachments    = &colorAtt;
+	ri.pDepthAttachment     = withDepthAttachment ? &depthAtt : nullptr;
+	ri.pStencilAttachment   = (withDepthAttachment && DepthHasStencil()) ? &stencilAtt : nullptr;
+
+	vkCmdBeginRendering(cmd, &ri);
+
+	VkViewport vp{};
+	vp.x        = 0.0f;
+	vp.y        = (float)sceneExtent.height;
+	vp.width    = (float)sceneExtent.width;
+	vp.height   = -(float)sceneExtent.height;
+	vp.minDepth = 0.0f;
+	vp.maxDepth = 1.0f;
+	vkCmdSetViewport(cmd, 0, 1, &vp);
+
+	VkRect2D scissor{ { 0, 0 }, sceneExtent };
+	vkCmdSetScissor(cmd, 0, 1, &scissor);
+	return true;
+}
+
+void VkSwapchain::EndScenePass()
+{
+	if (frameRecording)
+		vkCmdEndRendering(frames[currentFrame].cmd);
 }
 
 bool VkSwapchain::BeginSceneOverlayPass()

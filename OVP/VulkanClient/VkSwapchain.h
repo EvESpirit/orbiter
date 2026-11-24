@@ -35,6 +35,15 @@ public:
 	bool BeginFrame(HWND hWnd);
 	void ClearScene(const VkClearColorValue &clearColor);
 	bool FillScene(const RECT *rect, DWORD col);
+	bool BeginScenePass(
+		bool clearColor,
+		const VkClearColorValue &clearColorVal,
+		bool clearDepth,
+		float depthClearVal = 1.0f,
+		bool withDepthAttachment = true,
+		bool clearStencil = false,
+		uint32_t stencilClearVal = 0);
+	void EndScenePass();
 	bool BeginSceneOverlayPass();
 	void EndSceneOverlayPass();
 	void EndFrame();
@@ -54,6 +63,13 @@ public:
 	VkExtent2D SceneExtent() const { return sceneExtent; }
 	VkImageLayout SceneLayout() const { return sceneLayout; }
 
+	VkImage DepthImage() const { return depthImage; }
+	VkImageView DepthImageView() const { return depthView; }
+	VkFormat DepthFormat() const { return depthFormat; }
+	VkImageLayout DepthLayout() const { return depthLayout; }
+	bool DepthHasStencil() const { return depthFormat == VK_FORMAT_D24_UNORM_S8_UINT || depthFormat == VK_FORMAT_D32_SFLOAT_S8_UINT; }
+	VkFormat SceneStencilFormat() const { return DepthHasStencil() ? depthFormat : VK_FORMAT_UNDEFINED; }
+
 	VkCommandBuffer CurrentCommandBuffer() const { return frames[currentFrame].cmd; }
 	uint32_t CurrentFrameIndex() const { return currentFrame; }
 
@@ -67,6 +83,14 @@ public:
 	bool ReadbackSceneTarget(std::vector<uint8_t> &outBgra, uint32_t &outWidth, uint32_t &outHeight);
 
 	void TransitionSceneLayout(
+		VkCommandBuffer cmd,
+		VkImageLayout newLayout,
+		VkPipelineStageFlags2 srcStage,
+		VkAccessFlags2 srcAccess,
+		VkPipelineStageFlags2 dstStage,
+		VkAccessFlags2 dstAccess);
+
+	void TransitionDepthLayout(
 		VkCommandBuffer cmd,
 		VkImageLayout newLayout,
 		VkPipelineStageFlags2 srcStage,
@@ -112,6 +136,12 @@ private:
 	VkFormat sceneFormat = VK_FORMAT_B8G8R8A8_UNORM;
 	VkExtent2D sceneExtent{ 0, 0 };
 	VkImageLayout sceneLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+	VkImage depthImage = VK_NULL_HANDLE;
+	VkImageView depthView = VK_NULL_HANDLE;
+	VmaAllocation depthAlloc = VK_NULL_HANDLE;
+	VkFormat depthFormat = VK_FORMAT_D32_SFLOAT;
+	VkImageLayout depthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
 	FrameSync frames[kMaxFramesInFlight]{};
 	uint32_t currentFrame = 0;

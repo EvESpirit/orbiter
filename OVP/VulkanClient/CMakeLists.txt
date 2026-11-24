@@ -55,6 +55,9 @@ set(VKCLIENT_SOURCES
   VkSurface.cpp
   VkTextMgr.cpp
   VkPadTools.cpp
+  VkAABBUtil.cpp
+  VkVObject.cpp
+  VkScene.cpp
   VideoTab.cpp
   VulkanClient.cpp
   ${vk_bootstrap_SOURCE_DIR}/src/VkBootstrap.cpp
@@ -74,6 +77,11 @@ set(VKCLIENT_HEADERS
   VkSurface.h
   VkTextMgr.h
   VkPadTools.h
+  VkVertex.h
+  VkMath.h
+  VkAABBUtil.h
+  VkVObject.h
+  VkScene.h
   VideoTab.h
   VulkanClient.h
 )

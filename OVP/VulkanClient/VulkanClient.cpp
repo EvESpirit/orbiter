@@ -19,6 +19,8 @@
 #include "VkSurface.h"
 #include "VkTextMgr.h"
 #include "VkPadTools.h"
+#include "VkScene.h"
+#include "VkVObject.h"
 #include "VkLog.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
@@ -165,6 +167,10 @@ VulkanClient::~VulkanClient()
 		clbkReleaseFont(defaultFont);
 		defaultFont = nullptr;
 	}
+	if (ctx && ctx->Device())
+		vkDeviceWaitIdle(ctx->Device());
+	scene.reset();
+	VkVObject::GlobalExit();
 	DestroyAllSurfaces();
 	VkFontCache::ReleaseGpuResources();
 	blitter.reset();
@@ -335,6 +341,9 @@ HWND VulkanClient::clbkCreateRenderWindow()
 	viewW = swapchain->Extent().width;
 	viewH = swapchain->Extent().height;
 
+	VkVObject::GlobalInit(this);
+	scene = std::make_unique<VkScene>(this, viewW, viewH);
+
 	RenderSplashScreen(hWnd);
 
 	return hWnd;
@@ -462,7 +471,8 @@ void VulkanClient::UpdateViewportSize(HWND hWnd)
 
 void VulkanClient::clbkPostCreation()
 {
-	// STUB (Phase 2): Post-creation scene initialization
+	if (scene)
+		scene->Initialise();
 #ifdef VKCLIENT_SKETCHPAD_TEST
 	SketchPadTest();
 #endif
@@ -673,6 +683,9 @@ void VulkanClient::SketchPadTest()
 void VulkanClient::clbkCloseSession(bool fastclose)
 {
 	(void)fastclose;
+	if (ctx && ctx->Device())
+		vkDeviceWaitIdle(ctx->Device());
+	scene.reset();
 	stubParticleStreams.clear();
 }
 
@@ -749,6 +762,10 @@ void VulkanClient::clbkDestroyRenderWindow(bool fastclose)
 		clbkReleaseFont(defaultFont);
 		defaultFont = nullptr;
 	}
+	if (ctx && ctx->Device())
+		vkDeviceWaitIdle(ctx->Device());
+	scene.reset();
+	VkVObject::GlobalExit();
 	DestroyAllSurfaces();
 	VkFontCache::ReleaseGpuResources();
 	blitter.reset();
@@ -770,19 +787,53 @@ void VulkanClient::clbkBeginFrame()
 	if (swapchain->BeginFrame(hWnd)) {
 		viewW = swapchain->Extent().width;
 		viewH = swapchain->Extent().height;
+		if (scene)
+			scene->SetViewportSize(viewW, viewH);
 		++frameCounter;
 		ReclaimRetiredSurfaces();
 	}
 }
 
+void VulkanClient::clbkUpdate(bool running)
+{
+	(void)running;
+	if (scene)
+		scene->Update();
+}
+
 void VulkanClient::clbkRenderScene()
 {
-	// STUB (Phase 2): Replace solid clear with 3D scene pass
 	if (swapchain && swapchain->IsFrameRecording()) {
-		const VkClearColorValue clearCol = { { 1.0f, 0.0f, 1.0f, 1.0f } };
-		swapchain->ClearScene(clearCol);
+		if (scene) {
+			scene->RenderMainScene(*swapchain);
+		} else {
+			const VkClearColorValue clearCol = { { 1.0f, 0.0f, 1.0f, 1.0f } };
+			swapchain->ClearScene(clearCol);
+		}
 	}
 	Render2DOverlay();
+}
+
+void VulkanClient::clbkNewVessel(OBJHANDLE hVessel)
+{
+	if (scene)
+		scene->NewVessel(hVessel);
+}
+
+void VulkanClient::clbkDeleteVessel(OBJHANDLE hVessel)
+{
+	if (scene)
+		scene->DeleteVessel(hVessel);
+}
+
+int VulkanClient::clbkVisEvent(OBJHANDLE hObj, VISHANDLE vis, DWORD msg, DWORD_PTR context)
+{
+	(void)hObj;
+	if (!vis)
+		return 0;
+	VkVObject *vo = reinterpret_cast<VkVObject *>(vis);
+	vo->clbkEvent(msg, context);
+	return 1;
 }
 
 void VulkanClient::clbkEndFrame()

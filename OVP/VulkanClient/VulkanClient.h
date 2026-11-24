@@ -24,6 +24,7 @@ class VkBlitPipeline;
 class VkPadPipeline;
 class VkPanel2D;
 class VkSurfNative;
+class VkScene;
 
 namespace oapi {
 
@@ -110,9 +111,15 @@ protected:
 	void clbkSetSplashScreen(const char *fname, DWORD textCol) override;
 
 	void clbkBeginFrame() override;
+	void clbkUpdate(bool running) override;
 	void clbkRenderScene() override;
 	void clbkEndFrame() override;
 	bool clbkDisplayFrame() override;
+	void clbkNewVessel(OBJHANDLE hVessel) override;
+	void clbkDeleteVessel(OBJHANDLE hVessel) override;
+	int clbkVisEvent(OBJHANDLE hObj, VISHANDLE vis, DWORD msg, DWORD_PTR context) override;
+
+	VkScene *GetScene() const { return scene.get(); }
 
 private:
 	struct RetiredSurface {
@@ -137,6 +144,7 @@ private:
 	std::unique_ptr<VkBlitPipeline> blitter;                         ///< Per-session 2D textured/color-keyed blit pipeline
 	std::unique_ptr<VkPadPipeline> skpPipeline;                      ///< Per-session 2D Sketchpad pipeline and pad pool
 	std::unique_ptr<VkPanel2D> panel2d;                              ///< Per-session 2D panel, MFD & HUD mesh renderer
+	std::unique_ptr<VkScene> scene;                                  ///< Per-session 3D scene coordinator, camera & visuals
 	SURFHANDLE defaultPanelTex = nullptr;                            ///< Null.dds fallback texture for inactive MFD slots
 	Font *defaultFont = nullptr;                                     ///< Default fixed font for Sketchpad initialization
 	std::unordered_set<VkSurfNative *> surfaceCatalog;               ///< All live VkSurfNative instances in the session

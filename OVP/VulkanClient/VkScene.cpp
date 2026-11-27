@@ -6,6 +6,7 @@
 // ==============================================================
 
 #include "VkScene.h"
+#include "VkCelSphere.h"
 #include "VulkanClient.h"
 #include "VkSwapchain.h"
 #include "VkLog.h"
@@ -30,6 +31,7 @@ VkScene::VkScene(oapi::VulkanClient *client, DWORD w, DWORD h)
 
 VkScene::~VkScene()
 {
+	celSphere.reset();
 	DeleteAllVisuals();
 }
 
@@ -39,6 +41,8 @@ void VkScene::SetViewportSize(DWORD w, DWORD h)
 	viewH = h;
 	Camera.viewportW = w;
 	Camera.viewportH = h;
+	if (celSphere)
+		celSphere->SetViewportSize(w, h);
 }
 
 void VkScene::Initialise()
@@ -64,13 +68,18 @@ void VkScene::Initialise()
 		if (length(rpos) > 1.0)
 			sunLight.Dir = VkVec3(-unit(rpos));
 	}
+
+	if (gc) {
+		celSphere = std::make_unique<VkCelSphere>(gc, this);
+		if (!celSphere->Init())
+			VkLogWarn("VkScene: VkCelSphere initialisation incomplete");
+	}
 }
 
 void VkScene::OnOptionChanged(int cat, int item)
 {
-	(void)cat;
-	(void)item;
-	// Unit 2.2 forwards OPTCAT_CELSPHERE notifications to VkCelSphere.
+	if (celSphere)
+		celSphere->OnOptionChanged(cat, item);
 }
 
 double VkScene::GetObjectAppRad(OBJHANDLE hObj) const
@@ -367,10 +376,17 @@ void VkScene::RenderMainScene(VkSwapchain &swapchain)
 	};
 
 	if (swapchain.BeginScenePass(true, clearCol, true, 1.0f, true)) {
-		// Unit 2.2: render celestial sphere (skybox/stars/constellations/grids)
+		if (celSphere)
+			celSphere->Render(swapchain.CurrentCommandBuffer());
 		// Unit 2.4: render active stars & vessels (opaque -> alpha -> VC pass)
 		swapchain.EndScenePass();
 	}
+}
+
+void VkScene::RenderOverlay()
+{
+	if (celSphere)
+		celSphere->RenderOverlay();
 }
 
 void VkScene::SetCameraAperture(float ap, float as)

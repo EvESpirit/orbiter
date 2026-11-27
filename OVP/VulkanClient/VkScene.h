@@ -12,12 +12,14 @@
 #include "VkMath.h"
 #include "VkVObject.h"
 #include <list>
+#include <memory>
 #include <stack>
 
 namespace oapi {
 class VulkanClient;
 }
 class VkSwapchain;
+class VkCelSphere;
 
 #define RENDERPASS_UNKNOWN      0x0000
 #define RENDERPASS_MAINSCENE    0x0001
@@ -107,6 +109,9 @@ public:
 
 	void Update();
 	void RenderMainScene(VkSwapchain &swapchain);
+	void RenderOverlay();
+
+	VkCelSphere *GetCelSphere() const { return celSphere.get(); }
 
 	void NewVessel(OBJHANDLE hVessel);
 	void DeleteVessel(OBJHANDLE hVessel);
@@ -197,6 +202,7 @@ private:
 	VECTOR3 sky_color{ 0.0, 0.0, 0.0 };
 	double bglvl = 0.0;
 	DWORD bg_rgba = 0xFF000000;
+	std::unique_ptr<VkCelSphere> celSphere;
 };
 
 #endif // !__VKCLIENT_VKSCENE_H

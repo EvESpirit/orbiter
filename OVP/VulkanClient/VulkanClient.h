@@ -118,9 +118,15 @@ protected:
 	void clbkNewVessel(OBJHANDLE hVessel) override;
 	void clbkDeleteVessel(OBJHANDLE hVessel) override;
 	int clbkVisEvent(OBJHANDLE hObj, VISHANDLE vis, DWORD msg, DWORD_PTR context) override;
+	void clbkOptionChanged(DWORD cat, DWORD item) override;
 
+public:
+	VkContext *GetContext() const { return ctx.get(); }
+	VkSwapchain *GetSwapchain() const { return swapchain.get(); }
+	VkPadPipeline *GetPadPipeline() const { return skpPipeline.get(); }
 	VkScene *GetScene() const { return scene.get(); }
 
+protected:
 private:
 	struct RetiredSurface {
 		VkSurfNative *surf = nullptr;

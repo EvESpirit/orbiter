@@ -58,6 +58,9 @@ set(VKCLIENT_SOURCES
   VkAABBUtil.cpp
   VkVObject.cpp
   VkScene.cpp
+  VkSpherePatch.cpp
+  VkCSphereMgr.cpp
+  VkCelSphere.cpp
   VideoTab.cpp
   VulkanClient.cpp
   ${vk_bootstrap_SOURCE_DIR}/src/VkBootstrap.cpp
@@ -82,6 +85,9 @@ set(VKCLIENT_HEADERS
   VkAABBUtil.h
   VkVObject.h
   VkScene.h
+  VkSpherePatch.h
+  VkCSphereMgr.h
+  VkCelSphere.h
   VideoTab.h
   VulkanClient.h
 )
@@ -99,6 +105,22 @@ set(VKCLIENT_SHADERS
   Shaders/Panel2D.frag
   Shaders/Panel2DVertSpv.h
   Shaders/Panel2DFragSpv.h
+  Shaders/SceneLine.vert
+  Shaders/SceneLine.frag
+  Shaders/SceneLineVertSpv.h
+  Shaders/SceneLineFragSpv.h
+  Shaders/SceneStar.vert
+  Shaders/SceneStar.frag
+  Shaders/SceneStarVertSpv.h
+  Shaders/SceneStarFragSpv.h
+  Shaders/SceneLabel.vert
+  Shaders/SceneLabel.frag
+  Shaders/SceneLabelVertSpv.h
+  Shaders/SceneLabelFragSpv.h
+  Shaders/CelSphere.vert
+  Shaders/CelSphere.frag
+  Shaders/CelSphereVertSpv.h
+  Shaders/CelSphereFragSpv.h
 )
 
 set(VKCLIENT_API_HEADERS

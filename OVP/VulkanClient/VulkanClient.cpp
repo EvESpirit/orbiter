@@ -806,12 +806,19 @@ void VulkanClient::clbkRenderScene()
 	if (swapchain && swapchain->IsFrameRecording()) {
 		if (scene) {
 			scene->RenderMainScene(*swapchain);
+			scene->RenderOverlay();
 		} else {
 			const VkClearColorValue clearCol = { { 1.0f, 0.0f, 1.0f, 1.0f } };
 			swapchain->ClearScene(clearCol);
 		}
 	}
 	Render2DOverlay();
+}
+
+void VulkanClient::clbkOptionChanged(DWORD cat, DWORD item)
+{
+	if (scene)
+		scene->OnOptionChanged(int(cat), int(item));
 }
 
 void VulkanClient::clbkNewVessel(OBJHANDLE hVessel)

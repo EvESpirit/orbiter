@@ -86,6 +86,17 @@ public:
 		bool bPath,
 		bool loadAuxMaps = true);
 
+	static bool ComputeDdsByteSize(const uint8_t *bytes, size_t maxBytes, size_t &outDdsSize);
+
+	static VkSurfNative *LoadFromDdsMemory(
+		VkContext &context,
+		VkSwapchain &swap,
+		const uint8_t *bytes,
+		size_t byteSize,
+		const char *debugName = nullptr,
+		DWORD flags = 0,
+		const char *sourcePath = nullptr);
+
 	bool CopyFromHBITMAP(HBITMAP hbm, int srcX, int srcY, int srcW, int srcH);
 	bool UploadBgra(const uint8_t *bgra, size_t byteSize);
 	bool ReadbackBgra(std::vector<uint8_t> &outBgra, uint32_t &outWidth, uint32_t &outHeight);

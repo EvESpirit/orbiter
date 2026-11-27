@@ -843,6 +843,296 @@ VkSurfNative *VkSurfNative::Create(
 	return surf;
 }
 
+bool VkSurfNative::ComputeDdsByteSize(const uint8_t *bytes, size_t maxBytes, size_t &outDdsSize)
+{
+	outDdsSize = 0;
+	if (!bytes || maxBytes < 4 + sizeof(DdsHeader))
+		return false;
+
+	uint32_t magic = 0;
+	std::memcpy(&magic, bytes, sizeof(uint32_t));
+	if (magic != kDdsMagic)
+		return false;
+
+	DdsHeader hdr{};
+	std::memcpy(&hdr, bytes + 4, sizeof(DdsHeader));
+	const uint32_t w = std::max(1u, hdr.width);
+	const uint32_t h = std::max(1u, hdr.height);
+	const uint32_t mips = std::max(1u, hdr.mipMapCount);
+
+	const bool isFourCC = (hdr.ddspf.flags & kDdpfFourCC) != 0;
+	const uint32_t fourCC = hdr.ddspf.fourCC;
+
+	size_t total = 4 + sizeof(DdsHeader);
+	if (isFourCC && (fourCC == kFourCC_DXT1 || fourCC == kFourCC_DXT2 || fourCC == kFourCC_DXT3 || fourCC == kFourCC_DXT4 || fourCC == kFourCC_DXT5)) {
+		const size_t blockBytes = (fourCC == kFourCC_DXT1) ? 8u : 16u;
+		for (uint32_t m = 0; m < mips; ++m) {
+			const uint32_t mw = std::max(1u, w >> m);
+			const uint32_t mh = std::max(1u, h >> m);
+			total += (size_t)std::max(1u, (mw + 3u) / 4u) * std::max(1u, (mh + 3u) / 4u) * blockBytes;
+		}
+	} else {
+		const uint32_t bpp = hdr.ddspf.rgbBitCount;
+		const size_t bytesPerPix = bpp / 8u;
+		if (bytesPerPix == 0 || bytesPerPix > 4u)
+			return false;
+		for (uint32_t m = 0; m < mips; ++m) {
+			const uint32_t mw = std::max(1u, w >> m);
+			const uint32_t mh = std::max(1u, h >> m);
+			total += (size_t)mw * mh * bytesPerPix;
+		}
+	}
+
+	if (total > maxBytes)
+		return false;
+	outDdsSize = total;
+	return true;
+}
+
+VkSurfNative *VkSurfNative::LoadFromDdsMemory(
+	VkContext &context,
+	VkSwapchain &swap,
+	const uint8_t *bytes,
+	size_t byteSize,
+	const char *debugName,
+	DWORD flags,
+	const char *sourcePath)
+{
+	if (!bytes || byteSize < 4 + sizeof(DdsHeader))
+		return nullptr;
+
+	if (flags & (OAPISURFACE_RENDER3D | OAPISURFACE_SKETCHPAD))
+		flags |= OAPISURFACE_RENDERTARGET;
+	if (flags & (OAPISURFACE_RENDERTARGET | OAPISURFACE_GDI | OAPISURFACE_SYSMEM))
+		flags |= OAPISURFACE_UNCOMPRESS;
+
+	uint32_t magic = 0;
+	std::memcpy(&magic, bytes, sizeof(uint32_t));
+	if (magic != kDdsMagic)
+		return nullptr;
+
+	DdsHeader hdr{};
+	std::memcpy(&hdr, bytes + 4, sizeof(DdsHeader));
+
+	const uint32_t w = std::max(1u, hdr.width);
+	const uint32_t h = std::max(1u, hdr.height);
+	uint32_t fileMips = std::max(1u, hdr.mipMapCount);
+	if (flags & (OAPISURFACE_NOMIPMAPS | OAPISURFACE_RENDERTARGET | OAPISURFACE_GDI | OAPISURFACE_SYSMEM))
+		fileMips = 1;
+
+	const uint8_t *payload = bytes + 4 + sizeof(DdsHeader);
+	const size_t payloadLen = byteSize - (4 + sizeof(DdsHeader));
+
+	const bool isFourCC = (hdr.ddspf.flags & kDdpfFourCC) != 0;
+	const uint32_t fourCC = hdr.ddspf.fourCC;
+
+	const char *safeName = (debugName && debugName[0]) ? debugName : "MemDDS";
+	const std::string srcStr = sourcePath ? sourcePath : "";
+
+	if (isFourCC && (fourCC == kFourCC_DXT1 || fourCC == kFourCC_DXT2 || fourCC == kFourCC_DXT3 || fourCC == kFourCC_DXT4 || fourCC == kFourCC_DXT5)) {
+		VkFormat bcFmt = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+		size_t blockBytes = 8;
+		bool alpha = false;
+		if (fourCC == kFourCC_DXT2 || fourCC == kFourCC_DXT3) {
+			bcFmt = VK_FORMAT_BC2_UNORM_BLOCK;
+			blockBytes = 16;
+			alpha = true;
+		} else if (fourCC == kFourCC_DXT4 || fourCC == kFourCC_DXT5) {
+			bcFmt = VK_FORMAT_BC3_UNORM_BLOCK;
+			blockBytes = 16;
+			alpha = true;
+		} else {
+			bcFmt = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+			blockBytes = 8;
+			alpha = true;
+		}
+
+		if (flags & OAPISURFACE_UNCOMPRESS) {
+			const size_t mip0Size = (size_t)std::max(1u, (w + 3u) / 4u) * std::max(1u, (h + 3u) / 4u) * blockBytes;
+			if (payloadLen < mip0Size)
+				return nullptr;
+
+			std::vector<uint8_t> bgra;
+			bool decodedAlpha = false;
+			DecompressBcImageToBgra(payload, w, h, bcFmt, bgra, decodedAlpha);
+			if (flags & OAPISURFACE_NOALPHA)
+				decodedAlpha = false;
+			else if (flags & OAPISURFACE_ALPHA)
+				decodedAlpha = true;
+
+			const VkImageUsageFlags usage =
+				VK_IMAGE_USAGE_SAMPLED_BIT |
+				VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+				VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+				VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+			auto *surf = new VkSurfNative(context, swap);
+			surf->flags      = flags;
+			surf->sourcePath = srcStr;
+			surf->SetName(safeName);
+			if (!surf->AllocateGpuImage(w, h, 1, VK_FORMAT_B8G8R8A8_UNORM, usage, decodedAlpha, (flags & OAPISURFACE_RENDER3D) != 0) ||
+				!surf->UploadMipChain(bgra.data(), bgra.size(), { 0 }, { bgra.size() })) {
+				delete surf;
+				return nullptr;
+			}
+			return surf;
+		}
+
+		std::vector<size_t> mipOffsets;
+		std::vector<size_t> mipSizes;
+		size_t cursor = 0;
+		for (uint32_t m = 0; m < fileMips; ++m) {
+			const uint32_t mw = std::max(1u, w >> m);
+			const uint32_t mh = std::max(1u, h >> m);
+			const size_t sz = (size_t)std::max(1u, (mw + 3u) / 4u) * std::max(1u, (mh + 3u) / 4u) * blockBytes;
+			if (cursor + sz > payloadLen)
+				break;
+			mipOffsets.push_back(cursor);
+			mipSizes.push_back(sz);
+			cursor += sz;
+		}
+		if (mipOffsets.empty())
+			return nullptr;
+
+		if (flags & OAPISURFACE_NOALPHA)
+			alpha = false;
+		else if (flags & OAPISURFACE_ALPHA)
+			alpha = true;
+
+		const VkImageUsageFlags usage =
+			VK_IMAGE_USAGE_SAMPLED_BIT |
+			VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+			VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+		auto *surf = new VkSurfNative(context, swap);
+		surf->flags      = flags;
+		surf->sourcePath = srcStr;
+		surf->SetName(safeName);
+		surf->compressedMip0.assign(payload, payload + mipSizes[0]);
+		if (!surf->AllocateGpuImage(w, h, (uint32_t)mipOffsets.size(), bcFmt, usage, alpha, false) ||
+			!surf->UploadMipChain(payload, cursor, mipOffsets, mipSizes)) {
+			delete surf;
+			return nullptr;
+		}
+		return surf;
+	}
+
+	const uint32_t bpp = hdr.ddspf.rgbBitCount;
+	const size_t bytesPerPix = bpp / 8u;
+	if (bytesPerPix == 0 || bytesPerPix > 4)
+		return nullptr;
+
+	std::vector<uint8_t> bgraAll;
+	std::vector<size_t> mipOffsets;
+	std::vector<size_t> mipSizes;
+	size_t srcCursor = 0;
+	bool alpha = ((hdr.ddspf.flags & (kDdpfAlpha | kDdpfAlphaOnly)) != 0) || (hdr.ddspf.aBitMask != 0);
+
+	for (uint32_t m = 0; m < fileMips; ++m) {
+		const uint32_t mw = std::max(1u, w >> m);
+		const uint32_t mh = std::max(1u, h >> m);
+		const size_t srcMipBytes = (size_t)mw * mh * bytesPerPix;
+		if (srcCursor + srcMipBytes > payloadLen)
+			break;
+
+		const size_t dstOffset = bgraAll.size();
+		const size_t dstMipBytes = (size_t)mw * mh * 4u;
+		bgraAll.resize(dstOffset + dstMipBytes);
+
+		const uint8_t *src = payload + srcCursor;
+		uint8_t *dst = bgraAll.data() + dstOffset;
+		const size_t numPix = (size_t)mw * mh;
+
+		if (bpp == 32) {
+			const bool swapRB = (hdr.ddspf.rBitMask == 0x000000FFu);
+			const bool hasAMask = (hdr.ddspf.aBitMask != 0);
+			for (size_t i = 0; i < numPix; ++i) {
+				dst[i * 4 + 0] = swapRB ? src[i * 4 + 2] : src[i * 4 + 0];
+				dst[i * 4 + 1] = src[i * 4 + 1];
+				dst[i * 4 + 2] = swapRB ? src[i * 4 + 0] : src[i * 4 + 2];
+				dst[i * 4 + 3] = hasAMask ? src[i * 4 + 3] : 255;
+			}
+		} else if (bpp == 24) {
+			for (size_t i = 0; i < numPix; ++i) {
+				dst[i * 4 + 0] = src[i * 3 + 0];
+				dst[i * 4 + 1] = src[i * 3 + 1];
+				dst[i * 4 + 2] = src[i * 3 + 2];
+				dst[i * 4 + 3] = 255;
+			}
+		} else if (bpp == 16) {
+			if (hdr.ddspf.rBitMask == 0x0F00u) {
+				const bool hasA4 = (hdr.ddspf.aBitMask == 0xF000u);
+				for (size_t i = 0; i < numPix; ++i) {
+					const uint16_t v = (uint16_t)(src[i * 2 + 0] | (src[i * 2 + 1] << 8));
+					dst[i * 4 + 0] = (uint8_t)((v & 0xFu) * 17u);
+					dst[i * 4 + 1] = (uint8_t)(((v >> 4) & 0xFu) * 17u);
+					dst[i * 4 + 2] = (uint8_t)(((v >> 8) & 0xFu) * 17u);
+					dst[i * 4 + 3] = hasA4 ? (uint8_t)(((v >> 12) & 0xFu) * 17u) : 255;
+				}
+			} else {
+				const bool is5551 = (hdr.ddspf.gBitMask == 0x03E0u);
+				for (size_t i = 0; i < numPix; ++i) {
+					const uint16_t v = (uint16_t)(src[i * 2 + 0] | (src[i * 2 + 1] << 8));
+					if (is5551) {
+						dst[i * 4 + 0] = (uint8_t)((v & 0x1Fu) * 255u / 31u);
+						dst[i * 4 + 1] = (uint8_t)(((v >> 5) & 0x1Fu) * 255u / 31u);
+						dst[i * 4 + 2] = (uint8_t)(((v >> 10) & 0x1Fu) * 255u / 31u);
+						dst[i * 4 + 3] = (hdr.ddspf.aBitMask ? ((v & 0x8000u) ? 255 : 0) : 255);
+					} else {
+						DecodeRgb565(v, dst[i * 4 + 2], dst[i * 4 + 1], dst[i * 4 + 0]);
+						dst[i * 4 + 3] = 255;
+					}
+				}
+			}
+		} else if (bpp == 8) {
+			const bool isAlphaOnly = (hdr.ddspf.flags & kDdpfAlphaOnly) != 0 || (hdr.ddspf.aBitMask == 0xFFu && hdr.ddspf.rBitMask == 0);
+			for (size_t i = 0; i < numPix; ++i) {
+				const uint8_t v = src[i];
+				if (isAlphaOnly) {
+					dst[i * 4 + 0] = 255;
+					dst[i * 4 + 1] = 255;
+					dst[i * 4 + 2] = 255;
+					dst[i * 4 + 3] = v;
+				} else {
+					dst[i * 4 + 0] = v;
+					dst[i * 4 + 1] = v;
+					dst[i * 4 + 2] = v;
+					dst[i * 4 + 3] = 255;
+				}
+			}
+		}
+
+		mipOffsets.push_back(dstOffset);
+		mipSizes.push_back(dstMipBytes);
+		srcCursor += srcMipBytes;
+	}
+
+	if (mipOffsets.empty())
+		return nullptr;
+
+	if (flags & OAPISURFACE_NOALPHA)
+		alpha = false;
+	else if (flags & OAPISURFACE_ALPHA)
+		alpha = true;
+
+	const VkImageUsageFlags usage =
+		VK_IMAGE_USAGE_SAMPLED_BIT |
+		VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+		VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+		VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+	auto *surf = new VkSurfNative(context, swap);
+	surf->flags      = flags;
+	surf->sourcePath = srcStr;
+	surf->SetName(safeName);
+	if (!surf->AllocateGpuImage(w, h, (uint32_t)mipOffsets.size(), VK_FORMAT_B8G8R8A8_UNORM, usage, alpha, (flags & OAPISURFACE_RENDER3D) != 0) ||
+		!surf->UploadMipChain(bgraAll.data(), bgraAll.size(), mipOffsets, mipSizes)) {
+		delete surf;
+		return nullptr;
+	}
+	return surf;
+}
+
 VkSurfNative *VkSurfNative::LoadFromFile(
 	oapi::VulkanClient &client,
 	VkContext &context,
@@ -877,220 +1167,10 @@ VkSurfNative *VkSurfNative::LoadFromFile(
 
 	VkSurfNative *surf = nullptr;
 
-	if (magic == kDdsMagic && fileBytes.size() >= 4 + sizeof(DdsHeader)) {
-		DdsHeader hdr{};
-		std::memcpy(&hdr, fileBytes.data() + 4, sizeof(DdsHeader));
-
-		const uint32_t w = std::max(1u, hdr.width);
-		const uint32_t h = std::max(1u, hdr.height);
-		uint32_t fileMips = std::max(1u, hdr.mipMapCount);
-		if (flags & (OAPISURFACE_NOMIPMAPS | OAPISURFACE_RENDERTARGET | OAPISURFACE_GDI | OAPISURFACE_SYSMEM))
-			fileMips = 1;
-
-		const uint8_t *payload = fileBytes.data() + 4 + sizeof(DdsHeader);
-		const size_t payloadLen = fileBytes.size() - (4 + sizeof(DdsHeader));
-
-		const bool isFourCC = (hdr.ddspf.flags & kDdpfFourCC) != 0;
-		const uint32_t fourCC = hdr.ddspf.fourCC;
-
-		if (isFourCC && (fourCC == kFourCC_DXT1 || fourCC == kFourCC_DXT2 || fourCC == kFourCC_DXT3 || fourCC == kFourCC_DXT4 || fourCC == kFourCC_DXT5)) {
-			VkFormat bcFmt = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
-			size_t blockBytes = 8;
-			bool alpha = false;
-			if (fourCC == kFourCC_DXT2 || fourCC == kFourCC_DXT3) {
-				bcFmt = VK_FORMAT_BC2_UNORM_BLOCK;
-				blockBytes = 16;
-				alpha = true;
-			} else if (fourCC == kFourCC_DXT4 || fourCC == kFourCC_DXT5) {
-				bcFmt = VK_FORMAT_BC3_UNORM_BLOCK;
-				blockBytes = 16;
-				alpha = true;
-			} else {
-				bcFmt = VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
-				blockBytes = 8;
-				alpha = true;
-			}
-
-			const bool forceUncompress = (flags & OAPISURFACE_UNCOMPRESS) != 0;
-			if (forceUncompress) {
-				const size_t mip0Size = (size_t)std::max(1u, (w + 3u) / 4u) * std::max(1u, (h + 3u) / 4u) * blockBytes;
-				if (payloadLen < mip0Size)
-					return nullptr;
-
-				std::vector<uint8_t> bgra;
-				bool decodedAlpha = false;
-				DecompressBcImageToBgra(payload, w, h, bcFmt, bgra, decodedAlpha);
-				if (flags & OAPISURFACE_NOALPHA)
-					decodedAlpha = false;
-				else if (flags & OAPISURFACE_ALPHA)
-					decodedAlpha = true;
-
-				VkImageUsageFlags usage =
-					VK_IMAGE_USAGE_SAMPLED_BIT |
-					VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-					VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-					VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-
-				surf = new VkSurfNative(context, swap);
-				surf->flags      = flags;
-				surf->sourcePath = fullPath;
-				surf->SetName(fname);
-				if (!surf->AllocateGpuImage(w, h, 1, VK_FORMAT_B8G8R8A8_UNORM, usage, decodedAlpha, (flags & OAPISURFACE_RENDER3D) != 0) ||
-					!surf->UploadMipChain(bgra.data(), bgra.size(), { 0 }, { bgra.size() })) {
-					delete surf;
-					return nullptr;
-				}
-			} else {
-				std::vector<size_t> mipOffsets;
-				std::vector<size_t> mipSizes;
-				size_t cursor = 0;
-				for (uint32_t m = 0; m < fileMips; ++m) {
-					const uint32_t mw = std::max(1u, w >> m);
-					const uint32_t mh = std::max(1u, h >> m);
-					const size_t sz = (size_t)std::max(1u, (mw + 3u) / 4u) * std::max(1u, (mh + 3u) / 4u) * blockBytes;
-					if (cursor + sz > payloadLen)
-						break;
-					mipOffsets.push_back(cursor);
-					mipSizes.push_back(sz);
-					cursor += sz;
-				}
-				if (mipOffsets.empty())
-					return nullptr;
-
-				VkImageUsageFlags usage =
-					VK_IMAGE_USAGE_SAMPLED_BIT |
-					VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-					VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-
-				surf = new VkSurfNative(context, swap);
-				surf->flags      = flags;
-				surf->sourcePath = fullPath;
-				surf->SetName(fname);
-				surf->compressedMip0.assign(payload, payload + mipSizes[0]);
-				if (!surf->AllocateGpuImage(w, h, (uint32_t)mipOffsets.size(), bcFmt, usage, alpha, false) ||
-					!surf->UploadMipChain(payload, cursor, mipOffsets, mipSizes)) {
-					delete surf;
-					return nullptr;
-				}
-			}
-		} else {
-			// Uncompressed DDS (32-bit, 24-bit, 16-bit A4R4G4B4/R5G6B5, 8-bit A8/L8) -> convert mip chain to BGRA8
-			const uint32_t bpp = hdr.ddspf.rgbBitCount;
-			const size_t bytesPerPix = bpp / 8u;
-			if (bytesPerPix == 0 || bytesPerPix > 4)
-				return nullptr;
-
-			std::vector<uint8_t> bgraAll;
-			std::vector<size_t> mipOffsets;
-			std::vector<size_t> mipSizes;
-			size_t srcCursor = 0;
-			bool alpha = ((hdr.ddspf.flags & (kDdpfAlpha | kDdpfAlphaOnly)) != 0) || (hdr.ddspf.aBitMask != 0);
-
-			for (uint32_t m = 0; m < fileMips; ++m) {
-				const uint32_t mw = std::max(1u, w >> m);
-				const uint32_t mh = std::max(1u, h >> m);
-				const size_t srcMipBytes = (size_t)mw * mh * bytesPerPix;
-				if (srcCursor + srcMipBytes > payloadLen)
-					break;
-
-				const size_t dstOffset = bgraAll.size();
-				const size_t dstMipBytes = (size_t)mw * mh * 4u;
-				bgraAll.resize(dstOffset + dstMipBytes);
-
-				const uint8_t *src = payload + srcCursor;
-				uint8_t *dst = bgraAll.data() + dstOffset;
-				const size_t numPix = (size_t)mw * mh;
-
-				if (bpp == 32) {
-					const bool swapRB = (hdr.ddspf.rBitMask == 0x000000FFu);
-					const bool hasAMask = (hdr.ddspf.aBitMask != 0);
-					for (size_t i = 0; i < numPix; ++i) {
-						dst[i * 4 + 0] = swapRB ? src[i * 4 + 2] : src[i * 4 + 0];
-						dst[i * 4 + 1] = src[i * 4 + 1];
-						dst[i * 4 + 2] = swapRB ? src[i * 4 + 0] : src[i * 4 + 2];
-						dst[i * 4 + 3] = hasAMask ? src[i * 4 + 3] : 255;
-					}
-				} else if (bpp == 24) {
-					for (size_t i = 0; i < numPix; ++i) {
-						dst[i * 4 + 0] = src[i * 3 + 0];
-						dst[i * 4 + 1] = src[i * 3 + 1];
-						dst[i * 4 + 2] = src[i * 3 + 2];
-						dst[i * 4 + 3] = 255;
-					}
-				} else if (bpp == 16) {
-					if (hdr.ddspf.rBitMask == 0x0F00u) {
-						// A4R4G4B4 or X4R4G4B4
-						const bool hasA4 = (hdr.ddspf.aBitMask == 0xF000u);
-						for (size_t i = 0; i < numPix; ++i) {
-							const uint16_t v = (uint16_t)(src[i * 2 + 0] | (src[i * 2 + 1] << 8));
-							dst[i * 4 + 0] = (uint8_t)((v & 0xFu) * 17u);
-							dst[i * 4 + 1] = (uint8_t)(((v >> 4) & 0xFu) * 17u);
-							dst[i * 4 + 2] = (uint8_t)(((v >> 8) & 0xFu) * 17u);
-							dst[i * 4 + 3] = hasA4 ? (uint8_t)(((v >> 12) & 0xFu) * 17u) : 255;
-						}
-					} else {
-						// R5G6B5 or A1R5G5B5
-						const bool is5551 = (hdr.ddspf.gBitMask == 0x03E0u);
-						for (size_t i = 0; i < numPix; ++i) {
-							const uint16_t v = (uint16_t)(src[i * 2 + 0] | (src[i * 2 + 1] << 8));
-							if (is5551) {
-								dst[i * 4 + 0] = (uint8_t)((v & 0x1Fu) * 255u / 31u);
-								dst[i * 4 + 1] = (uint8_t)(((v >> 5) & 0x1Fu) * 255u / 31u);
-								dst[i * 4 + 2] = (uint8_t)(((v >> 10) & 0x1Fu) * 255u / 31u);
-								dst[i * 4 + 3] = (hdr.ddspf.aBitMask ? ((v & 0x8000u) ? 255 : 0) : 255);
-							} else {
-								DecodeRgb565(v, dst[i * 4 + 2], dst[i * 4 + 1], dst[i * 4 + 0]);
-								dst[i * 4 + 3] = 255;
-							}
-						}
-					}
-				} else if (bpp == 8) {
-					const bool isAlphaOnly = (hdr.ddspf.flags & kDdpfAlphaOnly) != 0 || (hdr.ddspf.aBitMask == 0xFFu && hdr.ddspf.rBitMask == 0);
-					for (size_t i = 0; i < numPix; ++i) {
-						const uint8_t v = src[i];
-						if (isAlphaOnly) {
-							dst[i * 4 + 0] = 255;
-							dst[i * 4 + 1] = 255;
-							dst[i * 4 + 2] = 255;
-							dst[i * 4 + 3] = v;
-						} else {
-							dst[i * 4 + 0] = v;
-							dst[i * 4 + 1] = v;
-							dst[i * 4 + 2] = v;
-							dst[i * 4 + 3] = 255;
-						}
-					}
-				}
-
-				mipOffsets.push_back(dstOffset);
-				mipSizes.push_back(dstMipBytes);
-				srcCursor += srcMipBytes;
-			}
-
-			if (mipOffsets.empty())
-				return nullptr;
-
-			if (flags & OAPISURFACE_NOALPHA)
-				alpha = false;
-			else if (flags & OAPISURFACE_ALPHA)
-				alpha = true;
-
-			VkImageUsageFlags usage =
-				VK_IMAGE_USAGE_SAMPLED_BIT |
-				VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-				VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-				VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-
-			surf = new VkSurfNative(context, swap);
-			surf->flags      = flags;
-			surf->sourcePath = fullPath;
-			surf->SetName(fname);
-			if (!surf->AllocateGpuImage(w, h, (uint32_t)mipOffsets.size(), VK_FORMAT_B8G8R8A8_UNORM, usage, alpha, (flags & OAPISURFACE_RENDER3D) != 0) ||
-				!surf->UploadMipChain(bgraAll.data(), bgraAll.size(), mipOffsets, mipSizes)) {
-				delete surf;
-				return nullptr;
-			}
-		}
+	if (magic == kDdsMagic) {
+		surf = LoadFromDdsMemory(context, swap, fileBytes.data(), fileBytes.size(), fname, flags, fullPath);
+		if (!surf)
+			return nullptr;
 	} else {
 		// Non-DDS file (PNG, BMP, JPG, TIF, or BMP disguised with .dds extension like Textures\adi.dds)
 		std::vector<uint8_t> bgra;
